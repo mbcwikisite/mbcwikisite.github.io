@@ -1,21 +1,16 @@
 ---
-category: Program
-date: '2015-09-23'
-layout: post
-published: true
-sha: f230676d74607a1a7d67c9bf9e102c1162b3ae82
-slug: bit-endian-little-endian-bit-field
-tags:
-  - cpp
-  - c
 title: 位域的大小端问题
+date: 2015-09-23 00:00:00 Z
+categories:
+- Program
+tags:
+- cpp
+- c
+layout: post
+sha: f230676d74607a1a7d67c9bf9e102c1162b3ae82
 info: 
 comment: 
-categories: []
-
 ---
-
-
 
 有如下位域结构体：
 

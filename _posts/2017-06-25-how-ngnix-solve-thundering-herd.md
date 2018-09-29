@@ -1,11 +1,14 @@
 ---
-layout: post
+title: Ngnix 是如何解决 epoll 惊群的
+date: 2017-06-25 00:00:00 Z
+categories:
+- Network
 tags:
-  - network
-  - linux
-title: 'Ngnix 是如何解决 epoll 惊群的'
-category: Network
+- network
+- linux
+layout: post
 ---
+
 Ngnix 的 master 进程在创建 socket，`bind()`和`listen()`之后，`fork()`出多个 worker，worker 会 将这个 socket 加入 epoll 中，用`epoll_wait()`来处理事件，当有一个新的连接来的时候，所有 worker 都会被唤醒，这就是所谓的 epoll 惊群。
 
 <!--more-->

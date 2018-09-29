@@ -1,10 +1,13 @@
 ---
-title: 'C++ 类型转换'
-layout: post
+title: C++ 类型转换
+date: 2016-11-13 00:00:00 Z
+categories:
+- Program
 tags:
-  - cpp
-category: Program
+- cpp
+layout: post
 ---
+
 C++的类型转换比较杂，看了又忘，再看也忘。在此，总结了一下。
 
 <!--more-->

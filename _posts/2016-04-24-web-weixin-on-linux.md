@@ -1,10 +1,13 @@
 ---
+title: Linux 上 Web 版本微信发布
+date: 2016-04-24 00:00:00 Z
+categories:
+- Linux
 tags:
-  - linux
+- linux
 layout: post
-title: 'Linux 上 Web 版本微信发布'
-category: Linux
 ---
+
 elementaryOS 或 Ubuntu 上的 Web 版微信应用。添加了 AppIndicator 消息提醒及 Libnotify 消息提醒功能。
 
 <!--more-->

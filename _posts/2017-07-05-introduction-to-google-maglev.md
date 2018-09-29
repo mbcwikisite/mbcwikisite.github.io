@@ -1,10 +1,13 @@
 ---
-title: 'Google Maglev 简介'
-layout: post
+title: Google Maglev 简介
+date: 2017-07-05 00:00:00 Z
+categories:
+- Network
 tags:
-  - network
-category: Network
+- network
+layout: post
 ---
+
 Google Maglev 是一个牛逼的负载均衡器，之所以牛逼，是因为它不用部署专门的物理设备，不像 LVS 一样工作在内核，它是运行在通用 Linux 服务器上的大型分布式软件系统。
 
 <!--more-->

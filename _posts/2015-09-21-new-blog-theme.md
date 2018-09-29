@@ -1,10 +1,13 @@
 ---
-category: Daily
-layout: post
+title: Blog 新主题
+date: 2015-09-21 00:00:00 Z
+categories:
+- Daily
 tags:
-  - daily
-title: 'Blog 新主题'
+- daily
+layout: post
 ---
+
 最终把整个 Hexo 的 Jacman 几乎全部移植过来了:smile:，好多 Jekyll 后端不支持的东西都需要前端来解决。
 
 <!--more-->

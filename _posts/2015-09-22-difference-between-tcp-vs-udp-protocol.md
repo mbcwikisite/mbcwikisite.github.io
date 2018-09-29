@@ -1,13 +1,13 @@
 ---
-published: true
-layout: post
 title: TCP 和 UDP 的区别
-category: Network
-tags: 
-  - tcp
-  - udp
+date: 2015-09-22 00:00:00 Z
+categories:
+- Network
+tags:
+- tcp
+- udp
+layout: post
 ---
-
 
  * TCP(Transmission Control Protocol)：传输控制协议
  * UDP(User Datagram Protocol)：用户数据报协议

@@ -1,10 +1,13 @@
 ---
-title: 'C++ 函数重载与函数匹配'
-layout: post
+title: C++ 函数重载与函数匹配
+date: 2016-12-17 00:00:00 Z
+categories:
+- Program
 tags:
-  - cpp
-category: Program
+- cpp
+layout: post
 ---
+
 《C++ Primer》笔记，整理关于函数重载与函数匹配的笔记。
 
 <!--more-->

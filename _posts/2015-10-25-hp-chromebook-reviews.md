@@ -1,10 +1,13 @@
 ---
+title: HP Chromebook 11 折腾体验
+date: 2015-10-25 00:00:00 Z
+categories:
+- Daily
 tags:
-  - daily
+- daily
 layout: post
-title: 'HP Chromebook 11 折腾体验'
-category: Daily
 ---
+
 前不久淘了一台 Chromebook，hp chromebook 11，ARM 架构。外观挺新的，轻巧方便。11吋的屏幕，可以随身携带。只带 ChromeOS，开机快速，浏览网页也挺快，挺流畅的，基本不卡。
 
 <!--more-->

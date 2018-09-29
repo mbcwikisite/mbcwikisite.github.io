@@ -1,10 +1,15 @@
 ---
-layout: post
-category: Embedded
 title: OpenWrt编译过程中出现的错误
+date: 2014-08-11 00:00:00 Z
+categories:
+- Embedded
+tags:
+- openwrt
+- embedded
+layout: post
 tagline: by Snail
-tags: [openwrt, embedded]
 ---
+
 编译OpenWrt不是件容易的事情，编译过程中要下载包，并且会出现很多奇怪的错误，经过几个小时的编译，终于成功了。
 
 <!--more-->

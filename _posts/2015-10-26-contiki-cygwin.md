@@ -1,11 +1,14 @@
 ---
+title: 在 Cygwin 上编译 Contiki
+date: 2015-10-26 00:00:00 Z
+categories:
+- Embedded
 tags:
-  - embedded
-  - contiki
+- embedded
+- contiki
 layout: post
-title: '在 Cygwin 上编译 Contiki'
-category: Embedded
 ---
+
 由于使用 Contiki 需要 Linux 环境，切换来切换去很麻烦，幸好 Windows 下面有 Unix 模拟环境软件，Cygwin。本文主要介绍 8051 核的 Contiki 编译，它的编译需要编译器 SDCC，所以本文介绍 SDCC 的编译。
 
 <!--more-->

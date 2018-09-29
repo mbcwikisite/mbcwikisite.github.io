@@ -1,10 +1,13 @@
 ---
+title: Jekyll Editor 应用上线
+date: 2015-10-11 00:00:00 Z
+categories:
+- Daily
 tags:
-  - daily
+- daily
 layout: post
-title: 'Jekyll Editor 应用上线'
-category: Daily
 ---
+
 Jekyll Editor 的 Chrome App 版本终于发布，具体地址为：[Jekyll Editor](https://chrome.google.com/webstore/detail/jekyll-editor/dfdkgbhjmllemfblfoohhehdigokocme?hl=zh-CN)。
 
 <!--more-->

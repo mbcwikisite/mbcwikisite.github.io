@@ -1,10 +1,13 @@
 ---
+title: Shadowsocks eOS/Ubuntu 客户端
+date: 2016-05-30 00:00:00 Z
+categories:
+- Linux
 tags:
-  - linux
+- linux
 layout: post
-title: 'Shadowsocks eOS/Ubuntu 客户端'
-category: Linux
 ---
+
 Shadowsocks-Qt5 太难用了，趁着有时间，写了一个跟 MacOS 上差不多的客户端，都是暴力 shell 调用。
 
 <!--more-->

@@ -1,13 +1,14 @@
 ---
-layout: post
-category: Android
 title: 强化你的Terminal IDE——在android平板/手机上编写C/C++
+date: 2012-11-24 00:00:00 Z
+categories:
+- Android
+tags:
+- android
+- cpp
+- c
+layout: post
 tagline: by Snail
-tags: 
-  - android
-  - cpp
-  - c
-published: true
 ---
 
 Terminal IDE是一个可扩展的终端应用，其包含了全功能的Java/HTML/Android开发套件。Terminal IDE集成了VIM, ssh, git等多个功能，其中强大之处，大家自己发觉，如果你用惯了Linux下的shell命令，那么用Terminal IDE你将会得心应手，喜欢上它的。

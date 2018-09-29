@@ -1,10 +1,15 @@
 ---
-layout: post
-category: Embedded
 title: 交叉编译OpenWrt上的Helloworld
+date: 2014-08-11 00:00:00 Z
+categories:
+- Embedded
+tags:
+- openwrt
+- embedded
+layout: post
 tagline: by Snail
-tags: [openwrt, embedded]
 ---
+
 终于编译完成了OpenWrt，并且成功交叉编译了Helloworld，并在Easy-Link的板子上运行。
 
 <!--more-->

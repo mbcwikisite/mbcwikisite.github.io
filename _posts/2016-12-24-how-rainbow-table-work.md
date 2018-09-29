@@ -1,10 +1,13 @@
 ---
 title: 彩虹表原理
-layout: post
+date: 2016-12-24 00:00:00 Z
+categories:
+- Network
 tags:
-  - network
-category: Network
+- network
+layout: post
 ---
+
 以前一直以为彩虹表就是一个大的数据库，破解的时候直接通过查表获得明文。今天发现我错了，彩虹表的原理还是挺有趣的。
 
 <!--more-->

@@ -1,10 +1,13 @@
 ---
-layout: post
+title: C++ 函数匹配及实参推断
+date: 2016-11-21 00:00:00 Z
+categories:
+- Program
 tags:
-  - cpp
-title: 'C++ 函数匹配及实参推断'
-category: Program
+- cpp
+layout: post
 ---
+
 记录一下函数重载、函数匹配、名字查找与实参类型推断的规则。
 
 <!--more-->

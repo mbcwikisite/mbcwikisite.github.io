@@ -1,10 +1,13 @@
 ---
+title: 如何上传 ppa
+date: 2016-04-24 00:00:00 Z
+categories:
+- Linux
 tags:
-  - linux
+- linux
 layout: post
-title: '如何上传 ppa'
-category: Linux
 ---
+
 简单记录一下 如何上传包到 launchpad 的 ppa上。
 
 <!--more-->

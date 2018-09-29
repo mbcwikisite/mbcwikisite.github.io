@@ -1,10 +1,16 @@
 ---
-layout: post
-category: Embedded
 title: VoCore启动成功
+date: 2014-08-06 00:00:00 Z
+categories:
+- Embedded
+tags:
+- vocore
+- openwrt
+- embedded
+layout: post
 tagline: by Snail
-tags: [vocore, openwrt, embedded]
 ---
+
 换了个VoCore板之后，VoCore就能正常启动了，顺便测试了一下ssh和ap+sta模式。
 
 <!--more-->

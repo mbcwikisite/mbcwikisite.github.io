@@ -1,10 +1,15 @@
 ---
-layout: post
-category: Embedded
 title: OpenWrt的编译
+date: 2014-08-10 00:00:00 Z
+categories:
+- Embedded
+tags:
+- openwrt
+- embedded
+layout: post
 tagline: by Snail
-tags: [openwrt, embedded]
 ---
+
 最近在淘宝上买了基于AR9331的Easy-Link模块，尝试着编译了一下OpenWrt，编译环境为ubuntu 12.04。
 
 <!--more-->

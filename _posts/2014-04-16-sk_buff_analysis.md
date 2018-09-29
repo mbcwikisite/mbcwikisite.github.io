@@ -1,10 +1,15 @@
 ---
-layout: post
-category: Linux
 title: sk_buff结构分析
+date: 2014-04-16 00:00:00 Z
+categories:
+- Linux
+tags:
+- linux
+- driver
+layout: post
 tagline: by Snail
-tags: [linux, driver]
 ---
+
 在wlan驱动中，数据读取写入是通过`sk_buff`这个结构体，而`sk_buff`结构主要作用是包含接收的缓冲数据，和它的包头信息。
 
 <!--more-->

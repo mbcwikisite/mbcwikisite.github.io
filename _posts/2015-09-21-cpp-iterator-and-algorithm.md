@@ -1,14 +1,13 @@
 ---
-published: true
 title: C++ 之迭代器与算法
-category: Program
-tags: 
-  - cpp
-  - c
+date: 2015-09-21 00:00:00 Z
+categories:
+- Program
+tags:
+- cpp
+- c
 layout: post
 ---
-
-
 
 C++ 有插入迭代器、流迭代器、反向迭代器、移动迭代器，泛型算法结构有适用的迭代器类别：输入迭代器、输出迭代器、前向迭代器、双向迭代器、随机访问迭代器。
 

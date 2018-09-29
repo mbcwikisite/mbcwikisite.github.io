@@ -1,19 +1,17 @@
 ---
+title: TCP之拥塞处理
+date: 2015-09-15 00:00:00 Z
 categories:
-  - Network
+- Network
 tags:
-  - 'tcp'
+- tcp
 comment: 
 info: 
-date: '2015-9-15'
 type: post
 layout: post
-published: true
 sha: bd7bdf473f6c04d3c0882b6a1732942d0f768875
-slug: tcp-congestion
-title: TCP之拥塞处理
-
 ---
+
 拥塞控制是发送方使用的流量控制，拥塞控制主要有四种算法：慢启动、拥塞避免、快速重传与快速恢复。
 
 <!--more-->

@@ -1,10 +1,11 @@
 ---
-published: true
-layout: post
 title: C++ 对象模型之构造函数
-category: Program
-tags: 
-  - cpp
+date: 2015-09-21 00:00:00 Z
+categories:
+- Program
+tags:
+- cpp
+layout: post
 ---
 
 看看以下这段代码：

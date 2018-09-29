@@ -1,10 +1,15 @@
 ---
-layout: post
-category: Embedded
 title: Linux-ZigBee项目：在Linux上运行6lowpan（一）
+date: 2014-10-30 00:00:00 Z
+categories:
+- Embedded
+tags:
+- linux
+- embedded
+layout: post
 tagline: by Snail
-tags: [linux, embedded]
 ---
+
 前段时间在看ZigBee的物理层和MAC层协议栈，也就是IEEE802.15.4协议。之后，发现sourceforge上有一个[linux-zigbee](http://sourceforge.net/projects/linux-zigbee/)的项目，[中文翻译介绍](http://blog.chinaunix.net/uid-29653824-id-4351049.html)。虽然这个项目叫Linux-ZigBee，但是因为许可问题除了IEEE802.15.4协议，其它的都没有实现，转而转向6lowpan，所以本文介绍一下用Ubuntu串口连接CC2530运行6lowpan。
 
 <!--more-->

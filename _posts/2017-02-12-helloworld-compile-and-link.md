@@ -1,10 +1,12 @@
 ---
-layout: post
+title: Hello World 的编译链接概述
+date: 2017-02-12 00:00:00 Z
+categories:
+- Program
 tags:
-  - cpp
-  - compiler
-title: 'Hello World 的编译链接概述'
-category: Program
+- cpp
+- compiler
+layout: post
 ---
 
 《程序员的自我修养》读书笔记，简单概述一个 Hello World 程序的编译链接过程。
