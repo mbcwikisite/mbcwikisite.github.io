@@ -1,0 +1,4383 @@
+<?xml version="1.0" encoding="utf-8"?>
+<search>
+  
+    <entry>
+      <title>Google Maglev 简介</title>
+      <url>/2017/07/05/introduction-to-google-maglev/</url>
+      <content type="text">Google Maglev 是一个牛逼的负载均衡器，之所以牛逼，是因为它不用部署专门的物理设备，不像 LVS 一样工作在内核，它是运行在通用 Linux 服务器上的大型分布式软件系统。
+
+
+
+Google Maglev 工作流程
+
+
+
+每个 Google 服务都有一个或者多个 VIP，一个 VIP 和物理 IP 的区别在于 VIP 没有绑给某个特定的网卡。
+
+VIP 宣告：
+
+Maglev 关联每个 VIP 到具体的 Endpoint，然后通过 BGP 将 VIP 宣告给上游路由器，然后路由器再把 VIP 宣告给 Google 的骨干网，这样使得 VIP 能被访问到。
+
+当用户访问 www.google.com 时：
+
+
+  浏览器先发送一个 DNS 请求， DNS 服务返回 VIP。 然后浏览器尝试与该 VIP 建立连接。
+  当路由器接收到 VIP 数据包，通过 ECMP 将数据包路由到 Maglev 集群中的某台机器上。
+  当 Maglev 的机器接收到数据包， 从关联到该 VIP 的 Endpoint 中选择一个， 然后用 GRE 封包发送，外层的 IP 即 Endpoint 的物理 IP。
+  当 Endpoint 处理完数据包进行响应时，源地址用 VIP 填充，目的地址为用户 IP。 使用直接服务返回(Direct Server Return， DSR) ，将响应直接发送给路由器， 这样 Maglev 无需处理响应包。
+
+
+Google Maglev 结构
+
+
+
+Maglev 由控制器（Controller）和 转发器（Forwarder）组成：
+
+
+  控制器向路由器宣告 VIP。控制器周期性地检查转发器的健康状态，来宣告或者撤回 VIP。确保路由器只转发包到健康的 Magvel。
+  转发器转发 VIP 流量到 Endpoint。每个 VIP 都有一个后端池（BP），BP 可能包含 Endpoint 的 IP，也有可能包含其它 BP。每个 BP 会对 Endpoint 进行健康检查，保证数据包转发到健康的 Endpoint。
+
+
+转发器的设计和实现
+
+转发器结构
+
+
+
+转发器直接从网卡接收数据包，通过 GRE/IP 封包，再将它们发回网卡。 Linux 内核不参与这个过程。
+
+
+  Steering 处理从 NIC（网卡）接收来的数据包，通过五元组（IP地址，源端口，目的IP地址，目的端口和传输层协议）哈希，然后交给不同的接收队列。
+  包重写线程从接收队列取包，然后进行后端选择，用 GRE 封包后，发送到传输队列。
+  Muxing 轮询从所有的传输队列取包，再发送给网卡。
+
+
+快速包处理
+
+
+
+Maglev 在包处理时绕开了 Linux 内核，因为内核开销非常严重。
+
+如图，转发器和网卡共用数据包池（Packet Pool），转发器中的 Steering 和 Muxing 都通过指针的环形队列，指向该池。
+
+对于 Seering：
+
+
+  当网卡接收到数据包时，放在 Recieved 所指位置，并向前移动指针。
+  分发包到接收队列时，向前移动Processed 指针。
+  预留未使用数据包，放入队列中并向前移动 Reserved 指针。
+
+
+对于 Muxing：
+
+
+  网卡将 Sent 所指的数据包发出去，并向前移动指针。
+  将被重写的数据包放入队列中，并向前移动 Ready 指针。
+  同时将已被发送的包归回给数据包池，并向前移动 Recycled 指针。
+
+
+整个过程都没有包拷贝。
+
+后端选择
+
+Maglev首先检查本地的连接跟踪表，看看该数据包是否属于任何一个已有的连接，如果连接已经建立，则直接将数据包发到该连接对应的服务器上去。如果连接没有建立，此时就需要一致性哈希函数选择一个后端服务器了，并添加到连接跟踪表。
+
+Maglev 一致性哈希的基本思想就是：
+
+
+  有一个共享的Entry表，可以通过Entry[Hash % M]选择对应后端，M为Entry表大小。
+  每个后端对所有Entry表位置有自己的优先级排序，存在permutation表里。
+  所有的后端通过优先级顺序轮流填充Entry 中的空白位置，直至填满。每次都填充自己优先级最高的空位置。
+
+
+例如，假设M = 6，且
+B0: permutation[] = { 3, 0, 4, 1, 5, 2, 6 }
+B1: permutation[] = { 0, 2, 4, 6, 1, 3, 5 }
+B2: permutation[] = { 3, 4, 5, 6, 0, 1, 2 }
+
+
+
+permutation优先级是从大到小，那么最后填充后的Entry表为：
+
+Entry[] = { B1, B0, B1, B0, B2, B2, B0 }
+
+
+
+说明：
+
+
+  
+    B0 的优先级最高的位置是Entry[3]，其为空，则Entry[3] = B0。
+    B1 是Entry[0]，则Entry[0]=B1。
+    B2 是Entry[3]，但是已被占，下一个是Entry[4]，为空，则Entry[4]=B2。
+    以此类推，直至填满。
+  
+
+
+操作经验
+
+VIP 匹配
+
+
+
+有时候，我们需要利用 Maglev 封包将流量重定向到其他的集群中的相同服务，这就有点麻烦了，因为集群间是独立的，我们不知道其它集群相同服务的 VIP。
+
+VIP 可以通过最长前缀匹配，来决定集群，利用最长后缀匹配决定那个后端池。
+
+如图中的例子，当请求 173.194.71.1 时，通过最长前缀（173.194.71.0/24）选择 C2 集群，通过最长后缀（0.0.0.1/8）决定是 Service 1 后端池。
+
+假定 Maglev 需要将流量转发到 C3（173.194.72.0/24），只需要用相同的后缀构造出 VIP （173.194.72.1）进行转发，即可转发到 Maglev 的 Service 1 后端池。
+
+分片处理
+
+分片时，非首个分片只包含三元组（目的IP地址，目的端口和传输层协议），这便无法正确决定如何转发，因为转发根据的是五元组。
+
+解决方法是：
+
+每个 Maglev 配置了一个特殊的后端池，包含所有的 Maglev 机器。
+
+一旦接收到分片， Maglev 用三元组哈希选择特定的 Maglev 作为后端进行转发，将它们重定向给相同的 Maglev。
+
+Maglev 为未分片数据包和第二跳的首分片使用相同的后端决策算法，以保证非分片、首个分片和非首个分片选择同一个后端。
+
+Magelv 维护了一个固定大小的分片表，记录了首分片的转发决策。 当 Maglev 收到一个第二跳非首分片， 会从分片表中查找，若匹配则立即转发； 否则，会缓存到分片表中，直到首分片收到或者老化。
+</content>
+      <categories>
+        
+          <category> Network </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> network </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>Macbook 中毒小记</title>
+      <url>/2017/07/01/remove-malware-on-macbook/</url>
+      <content type="text">本以为 macbook 很难中毒的，但是就是发生了，我也很无奈。
+
+
+
+中毒的表现为网页被劫持，老是弹 MacKeeper 的广告，中毒的原因可以是我装了一些流氓软件。
+
+浏览器时不时地会弹 ssp.zryydi.com 这个网站，本来我以为很好解决，上网搜了一下，都说用 MalwareBytes 扫描一下就好，然而我扫描不出来任何东西，有点慌了。
+
+我重置了 Safari 和 Chrome，关掉了代理服器，换路由，都没有用，不过频率减小了。因此应该是启动了不该启的进程。
+
+网上说，通过/Library/LaunchDaemon，/Library/LaunchAgent和~/Library/LaunchAgent来查找开机启动的流氓软件。找了一通只删掉了名字奇怪的文件，哎，当时就不应该心慈手软，删了之后还是没有起作用。
+
+正准备重装系统时，我找到了 Adware Removal Pro 这个软件，真是救星，还真的扫出了流氓软件，就是我当时不够狠，没有删的那几个文件，清理之后恢复正常。
+</content>
+      <categories>
+        
+          <category> Daily </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> daily </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>Ngnix 是如何解决 epoll 惊群的</title>
+      <url>/2017/06/25/how-ngnix-solve-thundering-herd/</url>
+      <content type="text">Ngnix 的 master 进程在创建 socket，bind()和listen()之后，fork()出多个 worker，worker 会 将这个 socket 加入 epoll 中，用epoll_wait()来处理事件，当有一个新的连接来的时候，所有 worker 都会被唤醒，这就是所谓的 epoll 惊群。
+
+
+
+epoll 惊群
+
+epoll 有两种工作方式：LT（水平触发） 和 ET（边缘触发）。LT 即只要有事件就通知，而 ET 则只有状态变化时才会通知。
+
+LT 状态下，只要有通知，所有监听这个 socket 的线程都会被唤醒。
+
+ET 状态下，内核只会通知一次（一个线程），因此无论是accept()、read()还是write()都要循环操作到底层返回EAGAIN为止。
+
+但是 ET 也会有竞争问题：线程A的epoll_wait()返回后，线程 A 不断的调用accept()处理连接请求，当内核的accept queue队列中的请求恰好处理完时候，内核会重新将该 socket 置为不可读状态，以便可以重新被触发；此时如果新来了一个连接，那么另外一个线程 B 可能被唤醒，然后执行accept()操作，不过此时之前的线程 A 还需要重新再执行一次accept()以确认accept queue已经被处理完了，此时如果线程A成功accept的话，线程 B 就被惊醒了（线程 B 没有accept成功）。
+
+历史上还存在过 accept 惊群，但现在的内核已经解决了这个问题，内核只会唤醒一个进程。
+
+Ngnix 的解决方法
+
+Ngnix 目前有几种方法解决惊群问题。
+
+accept_mutex 锁
+
+如果开启了accept_mutex锁，每个 worker 都会先去抢自旋锁，只有抢占成功了，才把 socket 加入到 epoll 中，accept 请求，然后释放锁。accept_mutex锁也有负载均衡的作用。
+
+accept_mutex效率低下，特别是在长连接的时候。因为长连接时，一个进程长时间占用accept_mutex锁，使得其它进程得不到 accept 的机会。因此不建议使用，默认是关闭的。
+
+EPOLLEXCLUSIVE 标识
+
+EPOLLEXCLUSIVE是4.5+内核新添加的一个 epoll 的标识，Ngnix  在 1.11.3 之后添加了NGX_EXCLUSIVE_EVENT。
+
+EPOLLEXCLUSIVE标识会保证一个事件发生时候只有一个线程会被唤醒，以避免多侦听下的“惊群”问题。不过任一时候只能有一个工作线程调用 accept，限制了真正并行的吞吐量。
+
+SO_REUSEPORT 选项
+
+SO_REUSEPORT 是惊群最好的解决方法，Ngnix 在 1.9.1 中加入了这个选项，每个 worker 都有自己的 socket，这些 socket 都bind同一个端口。当新请求到来时，内核根据四元组信息进行负载均衡，非常高效。
+
+参考：
+
+
+  http://xiaorui.cc/2015/12/02/使用socket-so_reuseport提高服务端性能/
+  http://pureage.info/2015/12/22/thundering-herd.html
+  http://www.cnblogs.com/sxhlinux/p/6254396.html
+  http://m.blog.csdn.net/russell_tao/article/details/7204260
+  https://www.zhihu.com/question/51618274?utm_medium=social&amp;amp;utm_source=wechat_session&amp;amp;from=groupmessage&amp;amp;isappinstalled=1
+  http://www.sohu.com/a/148006569_470018
+
+</content>
+      <categories>
+        
+          <category> Network </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> network </tag>
+        
+          <tag> linux </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>Hello World 的编译链接概述</title>
+      <url>/2017/02/12/helloworld-compile-and-link/</url>
+      <content type="text">《程序员的自我修养》读书笔记，简单概述一个 Hello World 程序的编译链接过程。
+
+
+
+有如下的hello.c源文件：
+
+#include &amp;lt;stdio.h&amp;gt;
+
+int main()
+{
+    printf(&quot;Hello World\n&quot;);
+    return 0;
+}
+
+
+
+可以用 GCC 来编译运行：
+
+$gcc hello.c
+$./a.out
+Hello World
+
+
+
+上述步骤可以分解为 4 个步骤，分别是预处理（Prepressing）、编译（Compilation）、汇编（Assembly）和链接（Linking）。
+
+被隐藏了的过程
+
+预处理
+
+$gcc -E hello.c -o hello.i
+
+
+
+或者：
+
+$cpp hello.c &amp;gt; hello.i
+
+
+
+预编译过程主要处理那些源代码文件听以“#”开始的预编译指令。
+
+经过预编译后的 .i 文件不包含任何宏定义，因为所有的宏已经被展开，并且包含的文件也已经被插入到 .i 文件中。
+
+编译
+
+$gcc -S hello.i -o hello.S
+
+
+
+或者使用cc1：
+
+$/usr/lib/gcc/i486-linux-gnu/4.1/cc1 hello.c
+
+
+
+编译过程就是把预处理完的文件进行一系列词法分析、语法分析、语义分析及优化后产生的相应的汇编代码文件。
+
+实际上 gcc 这个命令只是这些后台程序的包装，它会根据不同的参数要求去调用预编译编译程序 cc1、汇编器 as、链接器 ld。
+
+汇编
+
+$as hello.s -o hello.c
+
+
+或者：
+
+$gcc -c hello.s -o hello.o
+
+
+
+汇编器是将汇编代码转变成机器可以执行的指令，每一个汇编语句几乎都对应一条机器指令。
+
+链接
+
+$ld -static crt1.o crti.o crtbeginT.o hello.o -start-group -lgcc -lgcc_eh -lc -end-group crtend. crtn.o
+
+
+
+编译器做了什么
+
+编译过程一般可以分为6步：扫描、语法分析、语义分析、源代码优化、代码生成和目标代码优化。
+
+以如下代码为例：
+
+array[index] = (index + 4) * (2 + 6)
+
+
+
+词法分析
+
+源代码被输入到扫描器（Scanner），进行词法分析，生成一系列的记号（Token）。
+
+
+  
+    
+      记号
+      类型
+    
+  
+  
+    
+      array
+      标识符
+    
+    
+      [
+      左方括号
+    
+    
+      index
+      标识符
+    
+    
+      ]
+      右方括号
+    
+    
+      =
+      赋值
+    
+    
+      (
+      左圆括号
+    
+    
+      index
+      标识符
+    
+    
+      +
+      加号
+    
+    
+      4
+      数字
+    
+    
+      )
+      右圆括号
+    
+    
+      *
+      乘号
+    
+    
+      (
+      左圆括号
+    
+    
+      2
+      数字
+    
+    
+      +
+      加号
+    
+    
+      6
+      数字
+    
+    
+      )
+      右圆括号
+    
+  
+
+
+在识别记号的同时，扫描器也将标识符存放到符号表，将数字、字符串常量存放到文字表等。
+
+有一个叫 lex 的程序可以实现词法分析，它会按照用户之前描述好的词法规则将输入的字符串分割成一个个记号。
+
+语法分析
+
+语法分析器（Grammar Parser）将上述产生的记号进行语法分析，从而生成语法树（Syntax Tree）。
+
+有一个现有的工具叫 yacc（Yet Another Compiler Compiler）可以构建出语法树。
+
+语义分析
+
+语义分析器（Semantic Analyzer）完成了对表达式的语法层面的分析，即静态语义（Static Semantic），包括声明和类型匹配，类型的转换。
+
+语义分析阶段后，语法树的表达式都被标识了类型，如有隐式转换，则插入相应的转换节点。
+
+中间语言的生成
+
+源码优化器（Source Code Optimizer）将整个语法树转换成中间代码（Intermediate Code），常见的有三地址码（Three-address Code）和P-代码（P-Code），再进行源码级别的优化。
+
+中间代码使用编译器可以被分为前端和后端。编译器前端负责产生机器无关的中间代码，编译器后端将中间代码转换成目标机器代码。
+
+目标代码生成与优化
+
+代码生成（Code Generator）将中间代码转换成目标机器代码，目标代码化化器（Target Code Optimizer）则对目标代码进行优化。
+
+静态链接
+
+链接（Linking）的主要内容就是把各个模块之间相互引用的部分都处理好。
+
+链接过程主要包括了地址和空间分配（Address and Storage Allocation）、符号决议（Symbol Resolution）和重定位（Relocation）这些步骤。
+
+</content>
+      <categories>
+        
+          <category> Program </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> cpp </tag>
+        
+          <tag> compiler </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>彩虹表原理</title>
+      <url>/2016/12/24/how-rainbow-table-work/</url>
+      <content type="text">以前一直以为彩虹表就是一个大的数据库，破解的时候直接通过查表获得明文。今天发现我错了，彩虹表的原理还是挺有趣的。
+
+
+
+如果直接暴力破解 Hash 的明文太费时，如果通过查表的方法则太耗存储。彩虹表则是暴力破解与查表破解的折中。
+
+原理
+
+假设有这么一个函数R，可以将 Hash 值转化与字符串（非明文，而是另一个字符串），称其为衰减函数。假设p为明文，h为明文的 Hash 值，H为 Hash 函数。彩虹表在建表时，先选一个p[0]，做如下计算：
+
+h[0] = H(p[0])
+p[1] = R(h[0])
+h[1] = H(p[1])
+...
+h[k]  = H(p[k])
+...
+h[n - 1] = H(p[n - 1])
+p[n] = R(h[n - 1])
+
+
+
+其中n为迭代的次数。
+
+经过，这种运算之后，会形成一条 Hash 链：
+
+p[0]---&amp;gt;h[0]---&amp;gt;p[1]---&amp;gt;...---&amp;gt;p[k]---&amp;gt;h[k]---&amp;gt;...---&amp;gt;p[n]
+
+
+
+这条链上已经有n对明文到 Hash 值的对应关系了，但我们只保存首尾p[0]和p[n]，因为中间的值可以用p[0]重新通过上述的计算运算出来。
+
+彩虹表中有好多条这样的链 p[0]--&amp;gt;p[n]，n值取足够大。这样就可以用p[0]和p[n]的存储空间，存储n对的明文到 Hash 值的对应关系。
+
+破解
+
+假设待破解的 Hash 值为h'，那么我们可以反复地迭代运算 p' = R(h'), h‘= H(p')，直到p'与彩虹表中的某个p[n]相等。
+
+该链为p[0]--&amp;gt;p[n]，那么h'的明文很有可能在这条链中，因为这条链是通过p[0]反复迭代得到p[n]的，h'也是通过反复迭代得到p[n]。
+
+我们只要知道h'迭代到p[n]的次数，只在找到链中迭代到p[n]相同次数的h[k]，就可以获得其明文p[k]（在链中，h[k] = H(p[k])）。
+</content>
+      <categories>
+        
+          <category> Network </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> network </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>支付宝 AR 红包破解</title>
+      <url>/2016/12/21/alipay-ar-rb-crack/</url>
+      <content type="text">网上有好多支付宝的 AR 红包的破解方法，试了一下都不尽人意，所以自己撸了一下简单的。
+
+
+
+破解的想法非常简单：
+
+
+  遍历每一行，求 RGB 值的方差。
+  如果方差小于某个阈值则该行为小横条，用上面几行替换。
+
+
+网上还有好多其他的方法，比如先手工获得小横条位置、识别小横条的灰色，我就不折腾了。
+
+最后的效果没有那么好，有些识别不出来，亮色点的图片识别率会高一点。我识别出了周围的4个红包，还是挺麻烦的，玩玩就好。
+
+代码如下：
+
+
+
+</content>
+      <categories>
+        
+          <category> Daily </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> daily </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>C++ 函数重载与函数匹配</title>
+      <url>/2016/12/17/function-overload-and-match/</url>
+      <content type="text">《C++ Primer》笔记，整理关于函数重载与函数匹配的笔记。
+
+
+
+函数重载
+
+void func(int a); //原函数
+
+void func(double a); //正确：形参类型不同
+void func(int a, int b); // 正确：形参个数不同
+int func(int a); //错误：只有返回类型不同
+
+typedef int int32;
+void func(int32 a); //与原函数等价：形参类型相同
+void func(const int a); //与原函数等价：顶层 const 将被忽略
+void func(int); //与原函数等价：只是省略了形参名字
+
+
+
+函数重载有如下的规则：
+
+
+  名字相同，形参类型不一样。
+  不允许两个函数除了返回类型外其他所有的要素都相同。
+  顶层const的形参无法和没有顶层const的形参区分。
+
+
+其中返回类型不同时编译时会出错，而类型别名、项层const、省略形参名字只是重复声明而已，只要不定义，编译就不会出错，比如：
+
+//只定义了其中一个
+void func(int a);
+void func(const int a) {}
+
+
+
+函数匹配
+
+名字查找
+
+函数匹配的第一步便是名字查找（name lookup），确定候选函数。
+
+名字查找有两方面：
+
+
+  常规查找（normal lookup）
+  实参决定的查找（argument-dependent lookup，ADL）
+
+
+所有函数调用都会进行常规查找，只有函数的实参包括类类型对象或指向类类型对象的指针/引用的时候，才会进行实参决定的查找。
+
+常规查找
+
+void func(int a);	//1
+namespace N
+{
+	//作用域
+	void func() {}	//2
+	void func(double a) {}	//3
+	...
+	void test1()
+	{
+		func(); //候选函数为函数2和3
+	}
+	
+	void test2()
+	{
+		using ::func; //将函数1加入当前作用域
+		func(); //候选函数为函数1
+	}
+	...
+}
+
+
+
+从函数被调用的局部作用域开始，逐渐向上层寻找被调用的名字，一旦找到就停止向上寻找，将找到的所有名字加入候选函数。
+
+此外，using语句可以将其他作用域的名字引用到当前作用域。
+
+ADL查找
+
+void func() {} //1
+//第一个实参所在命名空间
+namespace Name1 {
+    class T {
+        friend void func(T&amp;amp;) {} //2
+    };
+    void func(T) {} //3
+}
+//第二个实参的间接父类所在命名空间
+namespace Name00 {
+    class T00 {
+        friend void func(int) {} //4
+    };
+    void func() {} //5
+}
+//第二个实参父类所在命名空间
+namespace Name0 {
+    class T0:public Name00::T00 {
+        friend void func(int) {} //6
+    };
+    void func() {} //7
+}
+//第二个实参所在命名空间
+namespace Name2 {
+    class T:public Name0::T0 {
+        friend void func(T&amp;amp;) {} //8
+    };
+    void func(T) {} //9
+}
+void test()
+{
+    Name1::T t1;
+    Name2::T t2;
+    //9个函数全是候选函数  
+    //第1个函数是normal lookup找到的
+    //后8个函数全是argument-dependent lookup找到的
+    func(&amp;amp;t1,t2);
+}
+
+
+
+从第一个类类型参数开始，依次遍历所有类类型参数。对于每一个参数，进入其类型定义所在的作用域（类内友元函数也包括在内），并依次进入其基类、间接基类……定义所在的作用域，查找同名函数，并加入候选函数。
+
+注意：在继承体系中上升的过程中，不会因为找到同名函数就停止上升，这不同于常规查找。
+
+类中的运算符重载也遵循 ADL 查找，其候选函数集既包括成员函数，也应该包括非成员函数。
+
+namespace N
+{
+	class A
+	{
+	public:
+		void operator+(int a) {} //1
+	};
+	void operator+(A &amp;amp;a, int a) {} //2
+};
+void operator+(A &amp;amp;a, int a) {} //3
+
+void test()
+{
+	N::A a;
+	a + 1; //1、2、3都是候选函数
+}
+
+
+
+确定可行函数
+
+第二步便是从候选函数中选出可行函数，选择的标准如下：
+
+
+  形参数量与本次调用提供的实参数量相等
+  每个实参的类型与对应的形参类型相同，或者能转换成形参类型
+
+
+//以下为候选函数
+void func(int a, double b) {} //可行函数
+void func(int a, int b) {} //可行函数：实参可转化成形参类型
+int func(int a, double b) {} //可行函数
+
+void func(int a) {} //非可行函数：形参数量不匹配
+void func(int a, int b[]) {} //非可行函数：实参不能转换成形参
+
+void test()
+{
+	func(1, 0.1);
+}
+
+
+
+寻找最佳匹配
+
+从可行函数中选择最匹配的函数，如果有多个形参，则最佳匹配条件为：
+
+
+  该函数每个实参的匹配都不劣于其他可行函数需要的匹配。
+  至少有一个实参的匹配优于其他可行函数提供的匹配。
+
+
+否则，发生二义性调用错误。
+
+//可行函数
+void func(int a, float b) {}
+void func(int a, int b) {}
+
+void test()
+{
+	func(1, 0.1); //二义性错误：double 向 int 的转换与向 float 的转换一样好
+	func(1, 1); //调用 void func(int a, int b)
+}
+
+
+
+为了确定最佳匹配，实参类型到形参类型的转换等级如下：
+
+
+  精确匹配：
+    
+      实参类型和形参类型相同。
+      实参从数组类型或函数类型转换成对应的指针类型。
+      向实参添加顶层const或者从实参中删除顶层const。
+    
+  
+  通过const转换实现的匹配。
+  通过类型提升实现的匹配。
+  通过算术类型转换或指针转换实现的匹配。
+  通过类类型转换实现的匹配。
+
+
+一般不会存在这个阶段不会同时存在两个以上的精确匹配，因为两个精确的匹配在本质上是等价的，在定义重载函数时，编译器可能就报出重定义的错误了。
+
+挑几个重点的来详细说一下。
+
+指针转换实现的匹配
+
+
+  0 或nullptr能转换成任意指针类型。
+  T * 能转换成 void *，const void *转换成const void*。
+  派生类向基类类型的转换。
+  函数与函数指针的形参类型必须精确匹配。
+
+
+类类型转换实现的匹配
+
+两个类型提供相同的类型转换将产生二义性问题。
+
+struct B;
+struct A
+{
+	A() = default;
+	A(const B&amp;amp;);	//把一个 B 转换成 A
+};
+
+struct B
+{
+	operator A() const; // 也是把一个 B 转换成 A
+};
+
+A f(const A&amp;amp;);
+
+B b;
+A a = f(b); //二义性错误：f(B::operator A()) 还是 f(A::A(const B&amp;amp;))
+
+A a1 = f(b.operator A()); //正确：使用 B 的类型转换运算
+A a2 = f(A(b)); //正确：使用 A 的构造函数
+
+
+
+类当中定义了多个参数都是算术类型的构造函数或类型转换运算符，也会产生二义性问题。
+
+struct A
+{
+	A(int = 0);
+	A(double);
+	operator int() const;
+	operator double() const;
+};
+
+void f(long double);
+
+A a;
+f(a); //二义性错误：f(A::operator int()) 还是 f(A::operator double())？
+
+long l;
+A a2(l); //二义性错误：A::A(int) 还是 A::A(double)？
+
+short s;
+A a3(s); //正确：使用 A::A(int)
+
+
+
+当我们使用两个用户定义的类型转换时，如果转换函数之前或之后存在标准类型转换，则标准类型转换将决定最佳匹配到底是哪个。
+</content>
+      <categories>
+        
+          <category> Program </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> cpp </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>C++ 函数匹配及实参推断</title>
+      <url>/2016/11/21/function-matching-and-argument-deduction/</url>
+      <content type="text">记录一下函数重载、函数匹配、名字查找与实参类型推断的规则。
+
+
+
+函数重载
+
+函数重载规则
+
+
+  名字相同，形参类型不一样。
+  不允许两个函数除了返回类型外其他所有的要素都相同。
+  顶层const的形参无法和没有顶层const的形参区分。
+
+
+重载与作用域
+
+
+  内层作用域中声明的名字，将隐藏外层作用域中声明的同名实体。
+  名字查找发生在类型检查之前。
+
+
+名字查找
+
+
+  首先，在名字所在的块中寻找其声明语句，只考虑在名字使用之前出现的声明。
+  如果没有找到，继续查找外层作用域。
+  如果最终没有找到匹配的声明，则程序报错。
+
+
+对于类的定义：
+
+
+  首先，编译成员的声明。
+  直到类全部可见后才编译函数体。
+
+
+函数匹配
+
+函数匹配步骤
+
+
+  确定候选函数和可行函数
+
+
+
+  选择函数名相同的、声明在调用点可见的函数作用候选函数。
+在候选函数中选出形参数量匹配并且类型可转换的函数作用可行函数。
+
+
+
+  寻找最佳匹配
+
+
+
+  从可行函数中选择最匹配的函数，如果有多个形参，则最佳匹配条件为：
+
+  
+    该函数每个实参的匹配都不劣于其他可行函数需要的匹配。
+    至少有一个实参的匹配优于其他可行函数提供的匹配。
+  
+
+  否则，发生二义性调用错误。
+
+
+实参类型转换等级
+
+具体排序如下：
+
+
+  精确匹配：
+    
+      实参类型和形参类型相同。
+      实参从数组类型或函数类型转换成对应的指针类型。
+      向实参添加顶层const或者从实参中删除顶层const。
+    
+  
+  通过const转换实现的匹配。
+  通过类型提升实现的匹配。
+  通过算术类型转换或指针转换实现的匹配。
+
+
+函数指针
+
+函数与函数指针的形参类型必须精确匹配。
+
+类类型转换运算符匹配
+
+如果类类型和目标类型之间存在多种转换的方式，则可能发生二义性错误：
+
+
+  两个类型提供相同的类型转换。
+  类定义了多个转换的规则。
+
+
+当我们使用两个用户定义的类型转换时，如果转换函数之前或之后存在标准类型转换，则标准类型转换将决定最佳匹配到底是哪个。
+
+重载函数与转换构造函数
+
+如果两个或多个类型转换都提供了同一种可行的匹配，则这些类型转换一样好。
+
+在调用重载函数时，如果需要额外的标准类型转换，则该转换的级别只有当所有可行函数请求同一个用户定义的类型转换时才有用。如果所需的用户定义的类型转换不止一个，则该调用具有二义性。
+
+函数匹配与重载运算符
+
+表达式中运算符的候选函数集既包括成员函数，也应该包括非成员函数。
+
+模板实参推断
+
+类型转换与模板类型参数
+
+能应用于函数模板的类型转换：
+
+
+  顶层 const 会被忽略。
+  const 转换：非 const 对象的引用（或指针）传递给一个 const 的引用（或指针）的形参。
+  数组或函数指针的转换。
+
+
+一个模板类型参数可以用作多个函数形参的类型。由于只允许有限的几种类型转换，因此传递给这些形参的实参必须具有相同的类型。
+
+正常类型转换应用于显示指定的实参。
+
+函数指针和实参推断
+
+当参数是一个函数模板实例的地址时，程序上下文必须満足：对每个模板参数，能唯一确定其类型或值。
+
+重载与模板
+
+
+  对于一个调用，其候选函数包括所有模板实参推断成功的函数模板实例。
+  候选的函数模板总是可行的，因为模板实参推断会排除任何不可行的模板。
+  可行函数按类型转换来排序，如果有一个函数比其他函数匹配更好，则选择此函数。
+  如果有多个函数提供同样好的匹配则：
+    
+      如果同样好的函数中 且个是非模板函数，则选择此函数。
+      如果没有非模板函数，如果其中一个模板函数更特例化，则选择此模板。
+      否则，此调用有歧义。
+    
+  
+
+
+异常类型与 catch 类型的匹配
+
+异常类型与catch类型必须精确匹配：
+
+
+  允许从非常量向常量转换。
+  允许从派生类向基类转换。
+  数组与函数转换成指针。
+
+</content>
+      <categories>
+        
+          <category> Program </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> cpp </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>C++ 字面值常量</title>
+      <url>/2016/11/14/cpp-literal/</url>
+      <content type="text">在类型转换和函数匹配中，字面值类型也是非常值得关注的。
+
+
+
+整型和浮点型字面值
+
+20 /* 十进制 */	024 /* 八进制 */	0x14 /* 十六进制 */
+
+
+
+默认情况下，十进制字面值是带符号数，八进制和十六进制既可能是带符号的也可能是无符号的。
+
+十进制字面值类型是int、long和long long中尺寸最小的。
+
+八进制和十六进制字面值类型是int、unsigned int、long、unsigned long、long long和unsigned long long中的尺寸最小者。
+
+严格来说，十进制字面值不会是负数，负数只是对字面值取负值而已。
+
+默认的，浮点型字面值是一个double。
+
+转义序列
+
+\x后紧跟1个或多个十六进制数字，或\后紧跟1个、2个或3个八进制数字。
+
+指定字面值的类型
+
+
+  
+    
+      前缀
+      含义
+      类型
+    
+  
+  
+    
+      u
+      Unicode 16 字符
+      char16_t
+    
+    
+      U
+      Unicode 32 字符
+      char32_t
+    
+    
+      L
+      宽字符
+      wchar_t
+    
+    
+      u8
+      UTF-8（仅用于字符串字面常量）
+      char
+    
+  
+
+
+
+  
+    
+      后缀
+      最小匹配类型
+      后缀
+      类型
+    
+  
+  
+    
+      u or U
+      unsigned
+      f 或 F
+      float
+    
+    
+      l or L
+      long
+      l 或 L
+      long double
+    
+    
+      ll or LL
+      long long
+       
+       
+    
+  
+
+
+</content>
+      <categories>
+        
+          <category> Program </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> cpp </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>C++ 类型转换</title>
+      <url>/2016/11/13/cpp-type-conversion/</url>
+      <content type="text">C++的类型转换比较杂，看了又忘，再看也忘。在此，总结了一下。
+
+
+
+隐式转换
+
+何时发生隐式转换
+
+
+  在大多数表达式中，比int类型小的整型值首先提升为较大的整数类型（整型提升）。
+  在条件中，非布尔值转换成布尔类型。
+  初始化过程中，初始化值转换成变量类型；在赋值语句中，右侧运算对象转换成左侧运算对象的类型。
+  如果算术运算或关系运算的运算有多种类型，需要转换成一种类型（算术转换）。
+  函数调用时也会发生类型转换。
+
+
+转换规则
+
+算术转换
+
+运算符的对象转换成最宽的对象。当表达式中既有浮点型也有整型类型时，整型值也转换成浮点型。
+
+整型提升
+
+小整数类型转换成较大的整数类型，对于bool、char、signed char、unsigned char、short和unsigned short，只要它们所有可能的值都能存在int里，它们就会提升成int类型，否则提升成unsigned int类型。
+
+较大的char类型（wchar_t、char16_t、char32_t）提升成int、unsigned int、long、unsigned long、long long和unsigned long long中最小的一种类型。
+
+无符号类型的运算对象
+
+首先进行整型提升，提升后如果符号相同则小类型转换大类型。如果符号不同，而其中无符号类型不小于带符号类型，则都转成无符号的；如果带符号类型大于无符号类型，如果无符号类型的所有值都能存在带符号类型中，则无符号转成带符号，如果不能，那么带符号转换无符号。
+
+派生类到基类转换
+
+
+  派生类型向基类类型转换只对指针或引用有效。
+  基类向派生类不存在隐式类型转换。
+  转换可能访问受限：
+    
+      只有公有继承时，用户代码才能使用该转换。
+      任意方式继承，成员函数和友元都能使用该转换。
+      D 公有继承或保存继承 B 时，则 D 的派生类的成员或友元才能使用 B 向 D 的转换。
+    
+  
+  能够将一个派生类对象拷贝、移动或赋值给一个基类对象，不过只处理派生类对象的基类部分。
+
+
+隐式的类类型转换（转换构造函数）
+
+能通过一个实参调用的构造函数定义了一条从构造函数的类型向类类型的隐式转换规则，只允许一步类类型转换（内置类型转换除外）。
+
+可以使用explicit抑制构造函数定义的隐式转换。
+
+其它隐式类型转换
+
+
+  数组自动转换成指针。
+  指针的转换：nullptr能转换成任意指针类型；指向任意非常量的指针能转换成void*；指向任意对象的指针能转换成const void *；继承关系指针的转换。
+  转换成布尔类型：如果指针或算术类型的值为0，转换结果为false；否则转换结果是true。
+  转换成常量：指向 T 的指针或引用分别转换成指向const T的指针或引用（顶层const）。
+  类类型定义的转换。
+
+
+显式转换
+
+
+  static_cast：只要不包含底层const，都可以使用static_cast。
+  const_cast：只能改变运算对象的底层const，如果对象本身是一个常量，那么行为未定义。
+  reinterpret_cast：为运算对象的位模式提供较底层次上的重新解释。
+  旧式强制类型转换：
+      type (expr);
+  (type) expr;
+
+    
+  
+
+</content>
+      <categories>
+        
+          <category> Program </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> cpp </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>OpenWRT 启动速度优化</title>
+      <url>/2016/10/24/optimized-openwrt-boot/</url>
+      <content type="text">OpenWRT 开机到 WiFi 启动需要花费 20 多秒，实在是太慢了， 对一些简单的应用来说无法接受。经过一些尝试，我把它优化在 8 秒以内。
+
+
+
+移除不用的包
+
+可以通过make menuconfig来移除一些用不着的软件包，如果不用 OpenWRT 的设置网页可以去掉luci软件包，如果不用上网可以移除firewall等等。
+
+当然最耗时的还有一些内核模块，比如说 USB 和 I2C 驱动什么的，如果不用可以移除。可以通过make kernel_menuconfig移除。
+
+启动项
+
+可以在目录/etc/rc.d/下查看启动项，不用的可以通过/etc/init.d/下的脚本来禁用，比如说telnet什么的。
+
+关闭 failsafe
+
+如果不用 failsafe，可以关掉，可以省去几秒的等待时间。自行修改/lib/下的脚本是没用的，得到 OpenWrt 的源码目录去修改，删掉 failsafe 的相关脚本就行。
+
+优化配置
+
+可以优化/etc/config/目录下的配置文件，无用的网络接口可以删掉。将 WiFi 的信道改成固定值可以节省非常多的时间。
+</content>
+      <categories>
+        
+          <category> Embedded </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> openwrt </tag>
+        
+          <tag> linux </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>Ubuntu 上自定义特殊波特率</title>
+      <url>/2016/06/30/odd-baudrate-on-ubuntu/</url>
+      <content type="text">在做嵌入式开发时，经常会需要特殊的串口波特率，比如 esp8266 的 74880 波特率。Ubuntu 下的 minicom 与 screen 都不支持这个波特率，可以使用setserial将特殊波特率映射到 38400。
+
+
+
+我简单试了一下，PL2303 和 CH341 都不支持用setserial进行特殊波特率的设置，而 FTDI 支持。
+
+首先，先安装setserial：
+
+sudo apt-get install setserial
+
+
+
+查看base_baud：
+
+sudo setserial -a /dev/ttyUSB0
+
+
+
+我得到的base_baud为 24000000。
+
+然后，进行分频：
+
+sudo setserial -v /dev/ttyUSB0 spd_cust divisor $((24000000/74880))
+
+
+
+就可以得到特殊波特率 74880，获取其它波特率的方法过程类似。
+
+然后，只需用波特率 38400 进行连接即可。
+</content>
+      <categories>
+        
+          <category> Embedded </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> linux </tag>
+        
+          <tag> embedded </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>Linux 版网易云音乐无限网络错误的解决</title>
+      <url>/2016/06/28/netease-music-network-error-solved/</url>
+      <content type="text">网易云音乐终于发布 Linux 版本了，但是在 elementaryOS 上播放音乐时出现了网络错误。
+
+
+
+网络上说可能是 gstreamer 依赖的问题，但没有具体的解决方法。我乱试了安装 gstreamer 的依赖，竟然让我试成功了！:satisfied:
+
+具体是安装gstreamer0.10-plugins-good的依赖：
+
+sudo apt-get install gstreamer0.10-plugins-good
+
+
+</content>
+      <categories>
+        
+          <category> Linux </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> linux </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>Shadowsocks eOS/Ubuntu 客户端</title>
+      <url>/2016/05/30/shadowsocks-ubuntu-eos-client/</url>
+      <content type="text">Shadowsocks-Qt5 太难用了，趁着有时间，写了一个跟 MacOS 上差不多的客户端，都是暴力 shell 调用。
+
+
+
+项目地址：http://simpleyyt.github.io/shadowsocks-eos/。
+
+Shadowsocks elementaryOS/Ubuntu（也许可以） 客户端（指示器）。
+
+截图
+
+
+
+功能
+
+
+  Shadowsocks 指示器，可以开关 Shadowsocks
+  全局代理与自动代理模式
+  编辑服务器
+  获取GWFList更新
+
+
+安装
+
+首先必须先安装shadowsocks与gfwlist2pac，可以通过pip安装：
+
+sudo pip install shadowsocks gfwlist2pac
+
+
+
+然后，下载 Shadowsocks 的 deb 包进行安装：https://github.com/simpleyyt/shadowsocks-eos/releases。
+
+Bugs
+
+代码很暴力，凑合能用就行。
+</content>
+      <categories>
+        
+          <category> Linux </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> linux </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>Linux 上 Web 版本微信发布</title>
+      <url>/2016/04/24/web-weixin-on-linux/</url>
+      <content type="text">elementaryOS 或 Ubuntu 上的 Web 版微信应用。添加了 AppIndicator 消息提醒及 Libnotify 消息提醒功能。
+
+
+
+
+
+功能
+
+
+  完整的 Web 微信功能
+  独立的窗口扫码界面
+  支持 AppIndicator 并有蓝点提示消息功能。
+  支持 libnotify 消息提醒。
+
+
+截图
+
+
+
+安装
+
+添加 PPA 并安装：
+
+sudo add-apt-repository ppa:simpleyyt/ppa
+sudo apt-get update
+sudo apt-get install web-weixin
+
+
+
+依赖
+
+
+  gobject-2.0
+  glib-2.0
+  gio-2.0
+  gtk+-3.0&amp;gt;=3.12
+  webkit2gtk-4.0
+  appindicator3-0.1
+
+
+编译
+
+mkdir build
+cd build
+cmake .. -DCMAKE_INSTALL_PREFIX=/usr
+make
+sudo make install
+
+
+
+Bugs
+
+
+  有时候需要退2次才能退出程序。
+
+</content>
+      <categories>
+        
+          <category> Linux </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> linux </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>如何上传 ppa</title>
+      <url>/2016/04/24/how-to-upload-to-ppa/</url>
+      <content type="text">简单记录一下 如何上传包到 launchpad 的 ppa上。
+
+
+
+生成 debian 目录
+
+在终端中输入：
+
+dh_make --createorig
+
+
+
+便会生成debian目录，并且有.orig.tar.gz源码包。
+
+根据需要修改debian目录里面的相应内容。
+
+上传 ppa
+
+在终端中输入：
+
+dput ppa:&amp;lt;userid&amp;gt;/&amp;lt;ppa-name&amp;gt; &amp;lt;source.changes&amp;gt;
+
+
+
+即可将软件包上传到 PPA 上。
+</content>
+      <categories>
+        
+          <category> Linux </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> linux </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>在 Cygwin 上编译 Contiki</title>
+      <url>/2015/10/26/contiki-cygwin/</url>
+      <content type="text">由于使用 Contiki 需要 Linux 环境，切换来切换去很麻烦，幸好 Windows 下面有 Unix 模拟环境软件，Cygwin。本文主要介绍 8051 核的 Contiki 编译，它的编译需要编译器 SDCC，所以本文介绍 SDCC 的编译。
+
+
+
+官方 8051 核的编译文档请参考 8051 Requirements。
+
+注：官方的 win32 版的 SDCC 并不适用。
+
+依赖
+
+必须确定安装以下依赖包，可以从 Cygwin 源中直接找到：
+
+
+  
+    gcc
+    flex
+    bison
+    libboost-graph-dev
+    python
+    make
+    texinfo
+  
+
+
+此外，还需要安装一个工具，srecord，下载 Win32 版本后，直接放于cygwin/bin/目录下即可。
+
+编译 SDCC
+
+SDCC 源码下载
+
+直接使用svn下载即可，本文版本为9377：
+
+svn co svn://svn.code.sf.net/p/sdcc/code/trunk/sdcc
+
+
+
+SDCC 源码修改
+
+
+  编辑device/lib/incl.mk，找到：
+
+
+ MODELS = small medium large
+
+
+
+修改成
+
+ MODELS = small large huge
+
+
+
+
+  编译device/lib/Makefile.in，找到：
+
+
+ TARGETS += models small-mcs51-stack-auto
+
+
+
+修改成：
+
+ TARGETS += models model-mcs51-stack-auto
+
+
+
+编译
+
+进行配置：
+
+./configure --disable-gbz80-port --disable-z80-port --disable-ds390-port --disable-ds400-port --disable-pic14-port --disable-pic16-port --disable-hc08-port --disable-r2k-port --disable-z180-port --disable-sdcdb --disable-ucsim
+
+
+
+编译并安装：
+
+make
+make install
+
+
+
+试用
+
+在 Contiki 的example/hello-world目录下运行：
+
+make TARGET=cc2530dk all
+
+
+
+便可以生成hello-world.hex。
+
+用 SmartRF Flash 工具便可以下载。
+
+关于编译 cc-tool
+
+还是别折腾了，因为 cygwin 下，libusb 不支持。
+</content>
+      <categories>
+        
+          <category> Embedded </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> embedded </tag>
+        
+          <tag> contiki </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>HP Chromebook 11 折腾体验</title>
+      <url>/2015/10/25/hp-chromebook-reviews/</url>
+      <content type="text">前不久淘了一台 Chromebook，hp chromebook 11，ARM 架构。外观挺新的，轻巧方便。11吋的屏幕，可以随身携带。只带 ChromeOS，开机快速，浏览网页也挺快，挺流畅的，基本不卡。
+
+
+
+翻墙问题
+
+本来用的是红杏进行翻墙，后来再阅兵前红杏挂了，一直都没有找到替找品，所幸学校的网络是可以上 Google 的，所以也就没有太在意。:sunglasses:
+
+电池及续航
+
+说实话，这台二手的 Chromebook续航能力不是很好，充满电也就能用3、4个小时，由于没有配充电器，用1A以下的充电器根本充不进去；用2A的充电器充电时，也会提示低功率充电。
+
+这算是这台机子不尽人意的一个地方。
+
+能否用作写代码
+
+作为程序员，最关心的便是能否用它来写代码。Chromebook 用来写 javascript 还是不错的，毕竟 ChromeOS 本身就是 Chrome 浏览器，对于 Web 开发者来说是福音，Chrome Web App Store 上有好多 IDE。
+
+除了 Javascript 之外，还有 python shell，lua shell，等等可以玩玩，但是做工程就算了吧。
+
+在 ChromeOS 上写 Chrome 应用也不错，应用商店提供了 Develop IDE，只是在本 Chromebook 上跑起来有点卡:worried:。
+
+ChromeOS 还提供了一个 NaCl Development Environment，上面有一本堆 shell 工具，比 crosh 好太多了，有 git，vim 之类的，但是不能访问下载目录。在本 chromebook 也不支持 gcc 编译器:weary: :sob:。
+
+开发者模式与 crouton
+
+可以进行开发模式，这样的 crosh 就可以支持 linux shell 一样的指令。但是每次开机都得按 Ctrl + D，挺麻烦的，所以就没搞过。
+
+crouton 是以 chroot 的方式，在 ARM 架构下也没有什么用，而且性能也不高，所以还是建议不要折腾。
+
+Web IDE
+
+写代码的另一种方式当然是 Web IDE 了，我试用了一下，Cloud9，Koding 都挺不错的，但是在墙内可能有点慢。
+
+ARC
+
+在 Chromebook 运行 Android 应用，缺点是大部分运行都出问题了，而且速度也挺慢，分辨率感人。
+
+感受
+
+整台 hp chromebook 11 的感觉还是不错的，至少比平板好，而且这个价，值得。
+</content>
+      <categories>
+        
+          <category> Daily </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> daily </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>Jekyll Editor 使用入门</title>
+      <url>/2015/10/11/jekyll-editor-tutorial/</url>
+      <content type="text">Jekyll Editor 专门为 Jekyll 博客定制的强大的 markdown 编辑器，它会自动从&amp;lt;yourname&amp;gt;.github.io仓库读取_post目录下的博客列表，并可以读取、创建、修改博客。
+
+
+
+项目
+
+
+  Github：https://github.com/Simpleyyt/jekyll-editor.git
+  Chrome 商店：https://chrome.google.com/webstore/detail/jekyll-editor/dfdkgbhjmllemfblfoohhehdigokocme
+
+
+主要功能
+
+
+  获取博文列表，发布、更新、修改博文
+  博文自动保存到本地
+  强大的 Markdown 编辑器
+
+
+使用说明
+
+
+
+左上角为编辑器的常用工具，包含emoji表情。右上角的工具依次为登录、全窗口预览、新博文、博文列表、元数据、提交博文，帮助、关于。
+
+首次使用时，必须先进行登录，也就是与 github 相连。
+
+博文列表
+
+
+
+博文列表会自动获取&amp;lt;yourname.github.io仓库读取_post目录下&amp;lt;date&amp;gt;-&amp;lt;slug&amp;gt;.md格式的文件，即为博文。
+
+元数据
+
+
+
+即博文的 yaml 格式数据，博文将会以文件名&amp;lt;date&amp;gt;-&amp;lt;slug&amp;gt;.md的格式更新。
+
+注：当“发布”打勾时，才会真正地发布。
+
+已知 Bug
+
+
+  在获取博文列表时，可能会由于多方面原因卡死
+  预览窗口的滚动条有时会出现问题
+  发布时可能会卡死
+
+</content>
+      <categories>
+        
+          <category> Daily </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> daily </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>Jekyll Editor 应用上线</title>
+      <url>/2015/10/11/jekyll-editor-online/</url>
+      <content type="text">Jekyll Editor 的 Chrome App 版本终于发布，具体地址为：Jekyll Editor。
+
+
+
+为了发布这个应用我真是费了好多心思，因为本人并没有 VISA 卡，也没有信用卡。我想到了一个神奇的网站，不是58，而是淘宝，搜了好久之后，发现有一种叫 VISA 虚拟卡，但是好像不能用，可能会被禁:flushed:。
+
+当然，还有一种是在线帮忙开，费用非常贵，要200多块，我还是咬咬牙就拍了:sob:。说多了都是泪，哎。
+
+Chrome App 地址为：https://chrome.google.com/webstore/detail/jekyll-editor/dfdkgbhjmllemfblfoohhehdigokocme?hl=zh-CN
+</content>
+      <categories>
+        
+          <category> Daily </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> daily </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>写 Jekyll 博客工具</title>
+      <url>/2015/10/09/tool-for-jekyll-blog/</url>
+      <content type="text">上次说要写一个类似 stackeditor 的东西来写 Jekyll 博客，终于写好了。这将是第一篇用该工具写的博客。
+
+
+
+详细的说明将会在发布之后再说:smiley:，它是 Chrome App，基于 Editor.md 的一个应用，挺不错的，该有的都有，就是有时候有会 Bug，:disappointed_relieved:。但是没事，我以后会慢慢改进。
+
+我已经把代码 push 到 github 上去了，项目地址：https://github.com/Simpleyyt/jekyll-editor.git，写得有点乱，以后再慢慢重构。还有一个重要的问题，我没有 chrome 开发者账号:frowning:，好惨。
+
+
+</content>
+      <categories>
+        
+          <category> Daily </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> daily </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>TCP 之保活计时器</title>
+      <url>/2015/09/23/tcp-keepalive-timer/</url>
+      <content type="text">保活计时器并不是 TCP 规范中的一部分，是一个有争论的功能。
+
+
+
+如果一个给定的连接在两个小时之内没有任何动作，则服务器就向客户发送一个探查报文段，客户机有如下状态：
+
+
+  
+    客户机仍正常运行，回复响应。服务器在两小时以后将保活定时器复位。
+    客户机已崩溃，TCP 都没有响应，75秒后超时。服务器总共发10个这样的探查，每个间隔75秒。
+    客户机已重新启动，客户机回复 RST。
+    客户机正常运行，但是服务不可到达，与状态2相同。
+  
+
+</content>
+      <categories>
+        
+          <category> Network </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> tcp </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>字节对齐</title>
+      <url>/2015/09/23/data-structure-alignmen/</url>
+      <content type="text">Linux 沿用的对齐策略是，2字节数据类型（例如short）的地址是2的倍数，而较大的数据类型（例如int、int*、float和double）的地址必须是4的倍数。
+
+
+
+Windows 要求任何 K 字节基本对象的址址必须是 K 的倍数，K = 2, 4 或者 8。特别的，它要求一个double或者long long类型数据的地址应该是8的倍数。
+
+对齐准则
+
+四个重要的基本概念：
+
+
+  
+    数据类型自身的对齐值：char型数据自身对齐值为1字节，short型数据为2字节，int/float型为4字节，double型为8字节。
+    结构体或类的自身对齐值：其成员中自身对齐值最大的那个值。
+    指定对齐值：#pragma pack (value)时的指定对齐值value。
+    数据成员、结构体和类的有效对齐值：自身对齐值和指定对齐值中较小者，即有效对齐值=min{自身对齐值，当前指定的pack值}。
+  
+
+
+其中，有效对齐值N是最终用来决定数据存放地址方式的值。有效对齐N表示“对齐在N上”，即该数据的“存放起始地址 % N = 0”。而数据结构中的数据变量都是按定义的先后顺序存放。第一个数据变量的起始地址就是数据结构的起始地址。结构体的成员变量要对齐存放，结构体本身也要根据自身的有效对齐值圆整(即结构体成员变量占用总长度为结构体有效对齐值的整数倍)。
+
+例1：
+struct A{
+    int    a;
+    char   b;
+    short  c;
+};
+struct B{
+    char   b;
+    int    a;
+    short  c;
+};
+
+
+
+结果：sizeof(strcut A)值为8；sizeof(struct B)的值却是12。
+
+例2：
+#pragma pack(2)  //指定按2字节对齐
+struct C{
+    char  b;
+    int   a;
+    short c;
+};
+#pragma pack()   //取消指定对齐，恢复缺省对齐
+
+
+
+结果：sizeof(struct C) = 8。
+
+栈内存对齐
+
+在VC/C++中，栈的对齐方式不受结构体成员对齐选项的影响。总是保持对齐且对齐在4字节边界上。（并未考证64位）
+
+位域对齐
+
+位域成员不能单独被取sizeof值。下面主要讨论含有位域的结构体的sizeof。
+
+C99 规定int、unsigned int和bool可以作为位域类型，但编译器几乎都对此作了扩展，允许其它类型的存在。位域作为嵌入式系统中非常常见的一种编程工具，优点在于压缩程序的存储空间。
+
+其对齐规则大致为：
+
+
+  
+    如果相邻位域字段的类型相同，且其位宽之和小于类型的sizeof大小，则后面的字段将紧邻前一个字段存储，直到不能容纳为止；
+    如果相邻位域字段的类型相同，但其位宽之和大于类型的sizeof大小，则后面的字段将从新的存储单元开始，其偏移量为其类型大小的整数倍；
+    如果相邻的位域字段的类型不同，则各编译器的具体实现有差异，VC6 采取不压缩方式，Dev-C++ 和 GCC 采取压缩方式；
+    如果位域字段之间穿插着非位域字段，则不进行压缩；
+    整个结构体的总大小为最宽基本类型成员大小的整数倍，而位域则按照其最宽类型字节数对齐。
+  
+
+
+例3：
+
+struct BitField{
+    char element1  : 1;
+    char element2  : 4;
+    char element3  : 5;
+};
+
+
+位域类型为char，第1个字节仅能容纳下element1和element2，所以element1和element2被压缩到第1个字节中，而element3只能从下一个字节开始。因此sizeof(BitField)的结果为2。
+
+例4：
+
+struct StructBitField{
+    int element1   : 1;
+    int element2   : 5;
+    int element3   : 29;
+    int element4   : 6;
+    char element5  :2;
+    char stelement;  //在含位域的结构或联合中也可同时说明普通成员
+};
+
+
+
+位域中最宽类型int的字节数为4，因此结构体按4字节对齐，在 VC6 中其sizeof为16。
+
+例5：
+
+struct BitField4{
+    char element1  : 3;
+    char  :0;
+    char element3  : 5;
+};
+
+
+
+长度为0的位域告诉编译器将下一个位域放在一个存储单元的起始位置。如上，编译器会给成员element1分配3位，接着跳过余下的4位到下一个存储单元，然后给成员element3分配5位。故上面的结构体大小为2。
+
+
+
+本文参考：http://www.cnblogs.com/clover-toeic/p/3853132.html
+</content>
+      <categories>
+        
+          <category> Program </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> cpp </tag>
+        
+          <tag> c </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>位域的大小端问题</title>
+      <url>/2015/09/23/bit-endian-little-endian-bit-field/</url>
+      <content type="text">有如下位域结构体：
+
+struct {
+    int a:4;
+    int b:16;
+    int c:12;
+};
+
+
+
+
+
+小端：
+
+在寄存器中分布如下：
+
+C11 C10 C9 C8 C7 C6 C5 C4 C3 C2 C1 C0 B15 B14 B13 B12 B11 B10 B9 B8 B7 B6 B5 B4 B3 B2 B1 B0 A3 A2 A1 A0
+
+
+
+在内存中存放格式为：
+
+0xXXXX0020: B3 B2 B1 B0 A3 A2 A1 A0
+0xXXXX0021: B11 B10 B9 B8 B7 B6 B5 B4
+0xXXXX0022: C3 C2 C1 C0 B15 B14 B13 B12
+0xXXXX0023: C11 C10 C9 C8 C7 C6 C5 C4
+
+
+
+大端：
+
+在寄存器中分布如下：
+
+A3 A2 A1 A0 B15 B14 B13 B12 B11 B10 B9 B8 B7 B6 B5 B4 B3 B2 B1 B0 C11 C10 C9 C8 C7 C6 C5 C4 C3 C2 C1 C0
+
+
+
+在内存中存放如下：
+
+0xXXXX0020: A3 A2 A1 A0 B15 B14 B13
+0xXXXX0021: B11 B10 B9 B8 B7 B6 B5 B4
+0xXXXX0022: B3 B2 B1 B0 C11 C10 C9 C8
+0xXXXX0023: C7 C6 C5 C4 C3 C2 C1 C0
+C11 C10 C9 C8 C7 C6 C5 C4  B15 B14 B13 B12 C3 C2 C1 C0  B11 B10 B9 B8 B7 B6 B5 B4  A3 A2 A1 A0 B3 B2 B1 B0
+
+
+
+
+
+本文转自：http://blog.sina.com.cn/s/blog_6f611c300102uznw.html
+</content>
+      <categories>
+        
+          <category> Program </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> cpp </tag>
+        
+          <tag> c </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>TCP 和 UDP 的区别</title>
+      <url>/2015/09/22/difference-between-tcp-vs-udp-protocol/</url>
+      <content type="text">
+  TCP(Transmission Control Protocol)：传输控制协议
+  UDP(User Datagram Protocol)：用户数据报协议
+
+
+主要从连接性(Connectivity)、可靠性(Reliability)、有序性(Ordering)、有界性(Boundary)、拥塞控制(Congestion or Flow control)、传输速度(Speed)、量级(Heavy/Light weight)、头部大小(Header size)等8个方面来讲。
+
+
+
+1. TCP是面向连接(Connection oriented)的协议，UDP是无连接(Connection less)协议；
+
+
+  TCP用三次握手建立连接：1) Client向server发送SYN；2) Server接收到SYN，回复Client一个SYN-ACK；3) Client接收到SYN_ACK，回复Server一个ACK。到此，连接建成。UDP发送数据前不需要建立连接。
+
+
+2. TCP可靠，UDP不可靠；
+
+
+  TCP丢包会自动重传，UDP不会。
+
+
+3. TCP有序，UDP无序；
+
+
+  消息在传输过程中可能会乱序，后发送的消息可能会先到达，TCP会对其进行重排序，UDP不会。
+
+
+4. TCP无界，UDP有界；
+
+
+  TCP通过字节流传输，UDP中每一个包都是单独的。
+
+
+5. TCP有流量控制（拥塞控制），UDP没有；
+
+
+  主要靠三次握手实现。
+
+
+6. TCP传输慢，UDP传输快；
+
+
+  因为TCP需要建立连接、保证可靠性和有序性，所以比较耗时。这就是为什么视频流、广播电视、在线多媒体游戏等选择使用UDP。
+
+
+7. TCP是重量级的，UDP是轻量级的；
+
+
+  TCP要建立连接、保证可靠性和有序性，就会传输更多的信息，如TCP的包头比较大。
+
+
+8. TCP的头部比UDP大；TCP Packet Format Diagram UDP Packet format
+
+总结：
+
+
+  
+    TCP是面向连接的、可靠的、有序的、速度慢的协议；UDP是无连接的、不可靠的、无序的、速度快的协议。
+    TCP开销比UDP大，TCP头部需要20字节，UDP头部只要8个字节。
+    TCP无界有拥塞控制，TCP有界无拥塞控制。
+  
+
+
+补充：
+
+
+  
+    基于TCP的协议有：HTTP/HTTPS，Telnet，FTP，SMTP。
+    基于UDP的协议有：DHCP，DNS，SNMP，TFTP，BOOTP。
+  
+
+
+
+
+本文转自：http://liangjiabin.com/blog/2015/03/difference-between-tcp-vs-udp-protocol.html
+</content>
+      <categories>
+        
+          <category> Network </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> tcp </tag>
+        
+          <tag> udp </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>C++对象模型之复制构造函数</title>
+      <url>/2015/09/22/cpp-object-model-copy-constructor/</url>
+      <content type="text">“如果一个 class 未定义出 copy constructor，编译器就自动为它产生出一个” 这句话是不对的，当 class 展现 bitwise copy semanics 时，编译器才会产生出来。
+
+
+
+如果一个 class 没有提供 explicit copy constructor，把每一个内建的或派生的 data member 的值，从某个 object 拷贝一份到另一个 object 身上，递归方式施行 memberwise initialization。
+
+例如：
+
+class String {
+    public:
+        // ... 没有 explicit copy constructor
+    private:
+        char *str;
+        int len;
+}
+
+
+
+有如下调用：
+
+String noun(&quot;book&quot;);
+String verb = noun;
+
+
+
+则会施行 memberwise initialization：
+
+verb.str = noun.str;
+verb.len = noun.len;
+
+
+如果一个 String object 被声明为另一个 class 的 member，那么进行 memberwise initialization 时，会递归实施。
+
+什么时候不展现出 bitwise copy semantics，也就是合成 copy constructor 呢，有4种情况：
+
+
+  
+    当 member object 存在 copy constructor。
+    当 base class 存在 copy constructor。
+    当 class 声明了 virtual functions 时。
+    当继承链中有 virtual base class 时。
+  
+
+
+前面两种情况，在此不做讨论。
+
+class 声明了 virtual functions
+
+这种情况下，可能需要重新设定 Virtual Table 的指针。
+
+举个例子：
+
+class ZooAnimal {
+public:
+    ZooAnimal();
+    virtual ~ZooAnimal();
+    
+    virtual void animate();
+    virtual void draw();
+};
+
+class Bear : public ZooAnimal {
+public:
+    Bear();
+    void animate();
+    void draw();
+    virtual void dance();
+};
+
+
+
+有如下使用：
+
+Bear yogi;
+Bear winnie = yogi;
+
+
+
+winnie会靠 bitwise copy semantics 完成，winnie和yogi都指向Bear class的 virual table。
+
+如果是如下使用：
+
+ZooAnimal franny = yogi; // 会发生切割行为
+
+
+
+franny的 vptr 不可以被设定指向Bear class的 virtual table，所以需要重新设定。
+
+Virtual Base Class 的 Subobject
+
+derived class object 的 virtual base class subobject 位置必须维护，bitwise copy semantics 可能会存坏这个位置。
+
+举个例子：
+
+class Raccon : public virtual ZooAnimal {
+public:
+    Raccoon() { }
+    Raccoon(int val) { }
+};
+
+class RedPanda : public Raccoon {
+public:
+    RedPanda() { }
+    RedPanda(int val) { }
+};
+
+
+
+如果是以下调用：
+
+Raccoon rocky;
+Raccoon little_critter = rocky;
+
+
+
+那么 bitwise copy 就可以了。
+
+如果是：
+
+RedPanda little_red;
+Raccoon little_critter = litter_red;
+
+
+
+这时候编译器必须安插代码以设定 virtual base class offset 的初值。
+</content>
+      <categories>
+        
+          <category> Program </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> cpp </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>写 Jekyll 博客的正确姿势</title>
+      <url>/2015/09/21/tools-for-jekyll/</url>
+      <content type="text">用 Jekyll 写博客有个麻烦的地方，就是你可能需要把博客git pull下来，修改完成commit后，再push上 GitHub；或者使用 GitHub 的在线编辑器编辑，无论哪种都非常麻烦。幸好找到了几个第三方的写博客和图床工具。
+
+
+
+写博客工具
+
+有两个工具，分别是Jekyll Editor、prose.io。
+
+Jekyll Editor
+
+
+
+Jekyll Editor 专门为 Jekyll 博客定制的强大的 markdown 编辑器，它会自动从&amp;lt;yourname&amp;gt;.github.io仓库读取_post目录下的博客列表，并可以读取、创建、修改博客。
+
+
+  Chrome 商店：https://chrome.google.com/webstore/detail/jekyll-editor/dfdkgbhjmllemfblfoohhehdigokocme
+
+
+Prose.io
+
+非常好的一个工具，它的编辑器非常强大，可以上传图片、文件等，可以在_config.yml文件中配置prose.io。
+
+
+
+缺点就是不支持实时预览，而且也不会自己保存。
+
+图床
+
+图床的话强烈推荐七牛，其缺点就是操作不人性化，但是 chrome 上面有好多相关的插件解决这个问题，比如极简图床 便是基于七牛的图床网站。
+
+图表工具
+
+写博客难免会需要用画一些图表，有两类图表，一类是 yUML、plantUML, 另一类是 draw.io。
+
+yUML 和 plantUML
+
+这类图表只需要按格式输入代码，便会自动产生图表，生成图片链接，省去了上传到图床，后期也可以修改。
+
+
+
+
+
+draw.io
+
+这个是在线手动绘图的工具，chrome 应用商店里面也下载得到离线应用，绘图完成之后需要上传到图床中。
+
+
+</content>
+      <categories>
+        
+          <category> Jekyll </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> jekyll </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>Blog 新主题</title>
+      <url>/2015/09/21/new-blog-theme/</url>
+      <content type="text">最终把整个 Hexo 的 Jacman 几乎全部移植过来了:smile:，好多 Jekyll 后端不支持的东西都需要前端来解决。
+
+
+
+最近突然想写博客，以前都是用作业部落在记笔记，以后还准备写一个类似 stackeditor 的工具用来写 Jekyll 博客。
+
+现在已经完美支持语法高亮：
+
+#include &amp;lt;iostream&amp;gt;
+using namespace std;
+
+int main() {
+    cout &amp;lt;&amp;lt; &quot;Hello World&quot; &amp;lt;&amp;lt; endl;
+    return 0;
+}
+
+
+</content>
+      <categories>
+        
+          <category> Daily </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> daily </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>C++ 对象模型之构造函数</title>
+      <url>/2015/09/21/cpp-object-model-constructor/</url>
+      <content type="text">看看以下这段代码：
+
+class Foo { public: int val; Foo *pnext; };
+
+void foo_bar()
+{
+    Foo bar;
+    if (bar.val || bar.pnext )
+        // ... do somthing
+    // ...
+}
+
+
+
+上述程序并不会合成出一个 default constructor。什么时候会合成出 default constructor 呢，下面分4种情况。
+
+
+
+带有 Default Constructor 的 Memeber Class Object
+
+编译器需要为该 class 合成一个 default constructor，不过这个合成操作只有在 constructor 真正需要被调用时才会发生。
+
+合成的 default constructor、copy constructor、destructor、assignment copy operator 都以inline方式完成，如果函数太复杂，不适合做成inline，就会合成出 explicit non-inline static 实例。
+
+举个例子：
+
+class Foo { public: Foo(); Foot(int ) ... };
+class Bar { public: Foo foo; char *str; };
+
+void foo_bar()
+{
+    Bar bar;
+}
+
+
+
+
+
+编译器会为class Bar合成一个 default constructor 来处理 Bar::foo，但它并不初始化Bar::str。
+
+合成的 default constructor 可能像这样：
+
+inline
+Bar::Bar()
+{
+    foo.Foo::Foo();
+}
+
+
+
+假设程序员提供了 default constructor：
+
+Bar::Bar() { str = 0; }
+
+
+
+则编译器会扩张已存在的 constructors：
+
+Bar::Bar()
+{
+    foo.Foo::Foo();
+    str = 0;
+}
+
+
+
+如果有多个 class member objects 都要求 constructor 初始化操作，C++ 语言将以 member objects 在 class 中的声明顺序来调用各个 constructors。
+
+带有 Default Constructor 的 Base Class
+
+将会合成 Default Constructor，会根据 base class 声明的顺序调用 base class 的 default constructor。
+
+如果有多个 constructors，编译器会扩张现有的每一个 constructors。
+
+带有一个 Virtual Function 的 Class
+
+以下两种情况，也需要合成出 default constructor：
+
+
+  
+    class 声明（或继承）一个 virtual function。
+    class 派生自一个继承串链，其中有一个或更多的 virtual base classes。
+  
+
+
+举个例子：
+
+class Widget {
+public:
+    virtual void flip() = 0;
+    // ...
+};
+
+void flip( const Widget&amp;amp; widget ) { widget.flip(); }
+
+void foo()
+{
+    Bell b;
+    Whistle w;
+    
+    flip(b);
+    flip(w);
+}
+
+
+
+
+
+编译期间发生两个扩张：
+
+
+  
+    virtual function table
+    pointer member （也就是 vptr ）
+  
+
+
+flip 函数可能被改写如下：
+
+( *widget.vptr[1] )( &amp;amp;widget )
+
+
+
+为了让这个机制发挥功效，编译器必须为每一个 Widget（或其派生类）object 的 vptr 设置初值，放置适当的 virtual table 地址。对于 class 所定义的每一个 constructor，编译器会安插一些代码来做这样的事情，如果没有 construcotr，则合成一个。
+
+带有一个 Virtual Base Class 的 Class
+
+例如以下代码：
+
+class X { public: int i; };
+class A : public virtual X { public: int j; };
+class B : public virtual X { public: double d; };
+class C : public A, public B { public: int k; };
+
+void foo(const A* pa) { pa-&amp;gt;i = 1024; }
+
+main()
+{
+    foo(new A);
+    foo(new C);
+}
+
+
+foo()可能被改写如下：
+
+void foo(const A* pa) { pa-&amp;gt;_vbcX-&amp;gt; = 1024; }
+
+
+
+class 所定义的每一个 constructor，编译器会安插代码来初始化_vbcX，如果没有 constructors，编译器必须合成一个 default constructor。
+
+总结
+
+C++ 新手一般有两个常见的误解：
+
+
+  
+    任何 class 如果没有定义 default constructor，就会被合成出一个来。
+    编译器合成出来的 default constructor 会显式设定 class 内每一个 data member 的默认值。
+  
+
+
+如你所见，没有一个是真的。
+
+</content>
+      <categories>
+        
+          <category> Program </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> cpp </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>C++ 之迭代器与算法</title>
+      <url>/2015/09/21/cpp-iterator-and-algorithm/</url>
+      <content type="text">C++ 有插入迭代器、流迭代器、反向迭代器、移动迭代器，泛型算法结构有适用的迭代器类别：输入迭代器、输出迭代器、前向迭代器、双向迭代器、随机访问迭代器。
+
+
+
+再探迭代器
+
+迭代器:
+
+
+  插入迭代器
+  流迭代器
+  反向迭代器
+  移动迭代器
+
+
+插入迭代器
+
+it = t //在it指定的当前位置插入值t。
+*it，++it,it++ //不会做任何事情，都返回it
+
+
+
+  back_inserter: push_back的迭代器
+  front_inserter: push_front的迭代器
+  inserter: 第二个参数指向给定容器的迭代器
+
+
+流迭代器
+
+istream_iterator&amp;lt;T&amp;gt; in(is); //in从输入流is读取类型为T的值
+istream_iterator&amp;lt;T&amp;gt; end;    //读取类型为T的值istream_iterator迭代器，表示尾后位置
+in1 == in2  //in1和in2必须读取相同类型
+in1 != in2
+*in //返回从流中读取的值
+in-&amp;gt;mem
+++in, in++
+
+
+
+ostream_itertor&amp;lt;T&amp;gt; out(os);
+ostream_iterator&amp;lt;T&amp;gt; out(os, d); 
+out = val
+*out, ++out, out++ //不做任何事
+
+
+
+可以为任何定义了输入运算符(»)的类型创建istream_iterator对象，类似的(«)可以创建ostream_iterator对象。
+
+反向迭代器
+
+
+  rbegin、rend、crbegin、crend
+
+
+反向迭代器需要递减运算符
+
+不可能从一个forward_list或一个流迭代器创建反向迭代器。
+
+泛型算法结构
+
+迭代器类别:
+
+
+  输入迭代器：== ！= ++ * -&amp;gt; 不保迭代器状态。
+  输出迭代器：++ * 只能赋值一次。
+  前向迭代器：输入和输出迭代器的操作，多次读写，多遍扫描。
+  双向迭代器：前置和后置递减运算符(--)。
+  随机访问迭代器：常量时间访问序列，(&amp;lt; &amp;lt;= &amp;gt; &amp;gt;= + += - -= - []）。
+
+
+算法形参模式
+
+alg(beg, end, other, args);
+alg(beg, end, dest, other, args);
+alg(beg, end, beg2, other, args);
+alg(beg, end, beg2, end2, other, args);
+
+
+
+
+  一些算法使用重载形式传递一个谓词
+  _if版本算法
+  区分拷贝元素的版本和不拷贝的版本
+
+
+特定容器算法
+
+链表类型list和forward_list定义了几个成员函数形式的算法：sort merge remove reverse unique。
+
+lst.merge(lst2)
+lst.merge(lst2,comp)
+lst.remove(val)
+lst.remove_if(pred)
+lst.reverse()
+lst.sort()
+lst.sort(comp)
+lst.unique()
+lst.unique(pred)
+
+
+
+splice成员:
+
+lst.splice(args)
+lst.splice_after(args)
+
+
+</content>
+      <categories>
+        
+          <category> Program </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> cpp </tag>
+        
+          <tag> c </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>如何使用 Jacman 主题</title>
+      <url>/2015/09/20/how-to-use-jacman/</url>
+      <content type="text">主题介绍
+Jekyll-Jacman 是为 Jekyll 设计的一款清新且具有响应式的主题，拥有更丰富的特性并支持了很多的国内服务。Jacman 始于 Jacman 移植而来。
+
+
+
+配置指南
+
+Jacman 主题提供了丰富的配置属性，可以实现您对主题的自定义。配置文件_config.yml位于主题根目录下。本次更新对配置文件进行了较大调整，如您之前就使用了 Jacman，也需要您根据以下指南进行相应的修改。
+
+##### 菜单
+menu:
+  主页: /
+  归档: /archives
+  关于: /about
+
+#### 控件
+widgets:
+- category
+- tag
+- links
+- rss
+
+#### RSS
+rss: /atom.xml
+
+#### 图片相关
+imglogo:
+  enable: true               ## 是否显示网站 logo
+  src: img/logo.png        
+favicon: img/favicon.ico     ## 网站图标    
+apple_icon: img/jacman.jpg   ## 苹果设备上的图标，背景不要透明
+author_img: img/author.jpg   ## 网站底部的博主头像
+banner_img: img/banner.jpg   ## 博客顶部的图片
+
+close_aside: false      ##是否在文章页面自动关闭侧边栏
+
+#### 首页相关
+index:
+  expand: true              ## 首页文章是否展开。默认为展开式，显示 Read More。
+  excerpt_link: Read More    
+
+#### 作者信息
+author:
+  name: ## 作者名
+  intro_line1:  &quot;Hello ,I'm Larry Page in Google.&quot;    ## 网站底部的个人介绍
+  intro_line2:  &quot;This is my blog,believe it or not.&quot;  
+  weibo_verifier:  ## 微博秀的验证码
+  tsina:           ## 用于微博秀和微博分享
+  weibo:           ## 用于显示网站底部社交按钮，下同
+  douban:         
+  zhihu:  
+  email:     
+  twitter:   
+  github:     
+  facebook:
+  linkedin:   
+  google_plus:   
+  stackoverflow:  
+
+
+#### 目录
+toc:
+  article: true   ## 是否在文章中显示目录
+  aside: true     ## 是否在侧边栏显示目录
+
+#### 友情链接
+links:
+  码农圈: https://coderq.com,一个面向程序员交流分享的新一代社区
+  Jark's Blog: http://wuchong.me
+
+#### 评论
+duoshuo_shortname:
+disqus_shortname:  
+
+#### 分享按钮
+jiathis:
+  enable: false   ## 默认使用主题内建分享
+  id:    
+  tsina:
+
+#### 网站统计
+google_analytics:
+  enable: false
+  id:            ## google analytics ID.
+  site:          ## 网站地址.
+baidu_tongji:
+  enable: false
+  sitecode:      ## 百度统计站点特征码
+cnzz_tongji:
+  enable: false
+  siteid:        ## CNZZ统计站点ID
+
+#### 杂项
+ShowCustomFont: true  
+fancybox: true        
+totop: true           
+
+#### 自定义搜索
+google_cse:
+  enable: false
+  cx:  
+baidu_search:    
+  enable: false
+  id:   
+  site: http://zhannei.baidu.com/cse/search
+tinysou_search:     ## http://tinysou.com/
+  enable: false
+  id: &quot;4ac092ad8d749fdc6293&quot;
+
+
+
+属性功能
+
+  菜单 menu
+默认没有启用 /tags 和 /categories页面，如果需要启用请在博客目录下分别建立tags 和 categories文件夹每个文件夹中分别包含一个index.md文件。内容为：
+
+
+layout: tags (或categories)
+title: tags (或categories)
+---
+
+
+
+      因为主题中已经内置了这两个页面的模板，所以他们会被正确的解析出来。
+
+
+  控件 widgets
+提供了7种小工具。包括标签、分类、RSS、友情链接、微博秀。
+
+
+友情链接：友情链接的网址添加可以在links属性下添加。
+
+微博秀：需要注意的是，如果要启用微博秀，您必须填上author属性下tsina和weibo_verifier的值，前者是您微博ID，后者是您微博秀的验证码，访问 http://app.weibo.com/tool/weiboshow 在如下图位置，可以获得您的 verifier，如：我的是b3593ceb。
+
+
+如果要关闭侧边栏，将close_aside置为true，就会在博文页面自动关闭侧边栏。
+
+
+  
+    图片相关 Image
+本主题可以设置网站相关图片，例如网站图标（favicon）、网站logo（imglogo）、作者头像（author_img）。建议启用网站logo，格式建议为.svg或.png格式。同时建议提供配套的 favicon 以及在苹果设备上的图标apple_icon（背景不要透明）。
+  
+  
+    首页显示模式 Index
+目前首页的显示模式支持两种，一种是原先的卡片式（前往 Demo 预览），另一种是类似官方主题的文章展开式（本站即采用的这种）。两者各有优劣，前者首页加载速度更快，后者文章内容更能吸引读者。主题默认采用后一种展开式，如需开启第一种卡片式，请设置index属性下的expand: false。
+  
+
+
+卡片式的文章摘要是截取文章内容的前140个字，也可以自己总结description并将其放在开头的front-matter中。展开式的文章摘要就是使用&amp;lt;!-- more --&amp;gt;截取了。
+
+
+  
+    作者信息 author
+作者信息，建议尽量填写完整。其中tsina是你的新浪微博ID，不同于用户名或微博主页地址。启用这个属性后，其他用户在微博上分享你文章的同时会自动@你。同时它和weibo_verifier一起作用生成微博秀。intro_line1和intro_line2是网站底部的个人介绍。weibo、twitter、facebook等是用来显示网站右下角的社交按钮的，如下图所示。
+
+  
+  
+    目录 toc
+是否启用在文章中或侧边栏中的目录功能。二者可以都为true或都为false。同时，如果你希望在特定的某一篇文章中关闭目录功能你可以在文章文件开头中的front-matter中加上一行toc: false。
+  
+  
+    评论 comments
+填写duoshuo_shortname多说的用户名，启用多说评论系统。在大陆地区更好用的评论系统。
+  
+
+
+填写disqus_shortnamedisqus 的用户名，启用 disqus 评论系统。国际上更广泛使用的评论系统。设置博客根目录下的_config.yml文件中的disqus_shortname同样也能开启该功能。
+
+
+  
+    加网分享 jiathis
+加网分享系统。默认关闭，因为主题已经内置了原生的分享功能。
+  
+  
+    网站统计 Analytics
+google_analytics：Google Analytics追踪代码。请注意：Google Analytics已经升级到了Universal Analytics。请先前往后台升级你的Google Analytics版本后再启用追踪代码，更多信息请点击这里了解。
+  
+
+
+baidu_tongji：百度统计功能。需要填写站点特征码sitecode，在官网注册并配置站点后，获取特征码。特征码可以在「网站中心」-&amp;gt; 「代码获取」中查看，如下图所示的e6d1f421bbc9962127a50488f9ed37d1，注意去掉前面的3F。
+
+
+cnzz_tongji：站长统计功能。需要填写站点IDsiteid，同理在站长官网注册并配置站点后获得。
+
+
+  
+    数学公式 mathjax
+主题支持写 LaTex 数学公式。只需要在文章文件开头的front-matter中，加上一行mathjax: true，即可在文中写 LaTex 公式。
+  
+  
+    图片浏览 fancybox
+默认关闭，如果你经常发表 Gallery 类型的文章，那么请设置为true。
+  
+  
+    返回顶部 totop
+右下角返回顶部按钮，默认开启。
+  
+  
+    自定义搜索 Search
+baidu_search：如果开启百度站内搜索需要登录 百度站内搜索，配置好你的站点，并开启站内搜索获取搜索ID，另外site属性可以填默认值，也可以填自己做了CNAME的二级域名，更详细的可以阅读这篇博客了解。
+  
+
+
+google_cse：如果开启谷歌自定义搜索需要先登录 Google CSE，配置好你的站点，并获得此自定义搜索的ID。此外你需要在博客目录下建立search文件夹并包含一个index.md文件。内容为：
+ layout: search
+ title: search
+ ---
+
+
+
+tiny_search: 如果要开启微搜索，需要先注册一个帐号，配置一个Engine，将Engine的Key填入配置文件中的id即可。
+
+常见问题
+
+  
+    Q：图片默认都是居左的，我怎么设置能让图片居中呢？
+
+    
+      使用 &amp;lt;img src=&quot;&quot; style=&quot;display:block;margin:auto&quot;/&amp;gt;的HTML标签。
+    
+  
+  
+    Q：如何建立一篇图片类文章（Gallery Post）？
+
+    
+      直接新建一个 Markdown 文件，将其front-matter修改为如下，即可看到主题为图片类文章提供的样式。
+
+      ---
+layout: photo
+title: Gallery Post
+photos:
+- http://i.minus.com/ibobbTlfxZgITW.jpg
+- http://i.minus.com/iedpg90Y0exFS.jpg
+---
+
+      
+    
+  
+  
+    Q：我在配置文件中给某一项设置了值，但为什么总是看不到效果啊？
+
+    
+      _config.yml文件中的每个属性值前面必须留一个空格，建议在 Sublime/Notepad++ 中开启显示所有空格模式。另每篇文章的 front-matter 也要注意这个问题。
+    
+  
+  
+    Q：怎么提意见和建议？
+
+    
+      主题还在不断完善中，欢迎 open issue 来提建议，参与讨论。
+    
+  
+  
+    Q：为什么我修改了配置文件/发表了博文，解析出来的却是乱码呢？
+
+    
+      请将你的配置文件/markdown文件保存成 UTF-8 格式。
+    
+  
+  
+    Q：为什么开启了微博秀后，显示是空白的，没有内容展示？
+
+    
+      每次修改参数都会这样，需要多刷新几次或者上传到服务器上就好了。
+    
+  
+
+</content>
+      <categories>
+        
+          <category> Jekyll </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> jekyll </tag>
+        
+          <tag> jacman </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>TCP之拥塞处理</title>
+      <url>/2015/09/15/tcp-congestion/</url>
+      <content type="text">拥塞控制是发送方使用的流量控制，拥塞控制主要有四种算法：慢启动、拥塞避免、快速重传与快速恢复。
+
+
+
+慢启动
+
+慢启动为发送方的 TCP 增加了一个窗口：拥塞窗口，记为cwnd，慢启动算法如下：
+
+
+  连接建好的开始先初始化 cwnd = 1，表明可以传一个 MSS 大小的数据。
+  每当收到一个 ACK，cwnd++，这是一种指数增加的关系。
+  发送方取拥塞窗口与通告窗口的最小值作为发送上限。
+
+
+拥塞避免算法
+
+慢启动算法是在一个连接上发起数据流的方法，但有时我们会达到中间路由器的极限，此时分组将被丢弃，拥塞避免算法是一种处理丢失分组的方法，有两种分组丢失的指示：发生超时和接收到重复的确认。
+
+拥塞避免算法和慢启动算法需要地每个连接维持两个变量：一个拥塞窗口 cwnd 和一个慢启动门限 ssthresh，算法如下：
+
+
+  初始化 cwnd = 1，ssthresh = 65535。
+  当拥塞发生时（超时或收到重复确认），ssthreash 设置当前窗口大小的一半（cwnd 和通告窗口大小的最小值，但最小为2个报文）。如果是超时引起的拥塞，则 cwnd 设置为1，进入慢启动过程，否则进入慢速重传与恢复算法。
+  cwnd &amp;lt;= ssthresh，进行慢启动；否则正在进行拥塞避免，每次收到一个确认时将 cwnd 增加 1 / cwnd，这是一种加性增长。
+
+
+快速重传与快速恢复
+
+在收到一个失序的报文段时，TCP 立即需要产生一个重复的 ACK，我们不知道一个重复的 ACK 是不是丢失的报文引起的。如果收到3个或3个以上的重复 ACK，那非常有可能是一个报文段丢失了，快速重传与快速恢复算法如下：
+
+
+  当收到3个重复的 ACK 时，ssthresh = cwnd / 2，cwnd = sshthresh + 3 * MSS，重传丢失报文段。
+  再次收到重复的 ACK 时，cwnd = cwnd + 1。
+  如果收到了新的 ACK，cwnd = sshthresh，进入拥塞避免算法。
+
+</content>
+      <categories>
+        
+          <category> Network </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> tcp </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>Linux-ZigBee项目：在Linux上运行6lowpan（一）</title>
+      <url>/2014/10/30/6lowpan_on_linux/</url>
+      <content type="text">前段时间在看ZigBee的物理层和MAC层协议栈，也就是IEEE802.15.4协议。之后，发现sourceforge上有一个linux-zigbee的项目，中文翻译介绍。虽然这个项目叫Linux-ZigBee，但是因为许可问题除了IEEE802.15.4协议，其它的都没有实现，转而转向6lowpan，所以本文介绍一下用Ubuntu串口连接CC2530运行6lowpan。
+
+
+
+#交叉编译内核#
+
+由于主线内核只包含了ieee802154、fakehard和6lowpan，所以没办法使用ZigBee串口设备。所以要下载linux-zigbee内核：
+
+git clone git://git.code.sf.net/p/linux-zigbee/kernel -b 6lowpan linux-zigbee-kernel
+
+
+
+当然也可以去项目主页下载。下载完成之后，进行源码目录，然后：
+
+make menuconfig
+
+
+
+选择mac802154、ieee802154和serial等模块。然后保存退出，进行编译：
+
+make -j 2
+
+
+
+如果出现错误可以网上搜解决方法，编译完成之后，编译模块：
+
+make modules
+
+
+
+接着安装模块：
+
+make modules_install
+
+
+
+安装内核：
+
+make install
+
+
+
+至此，内核已经编译并且安装成功了。重启PC之后，加载相关模块：
+
+sudo modprobe ieee802154
+sudo modprobe mac802154
+sudo modprobe af_802154
+sudo modprobe serial
+
+
+
+每当需使用时，都必须加载上述模块。
+
+#安装lowpan-tools#
+
+lowpan-tools是管理Linux LowPAN协议栈的工具，由于Ubuntu的lowpan-tools版本太老了，所以需要从项目主页下载安装：
+
+git clone git://git.code.sf.net/p/linux-zigbee/linux-zigbee linux-zigbee-linux-zigbee
+
+
+
+下载完成之后，进入源码目录安装：
+
+./autogen.sh
+sudo make install
+
+
+
+安装完成之后，便可以使用izattach工具添加ZigBee串口设备。
+</content>
+      <categories>
+        
+          <category> Embedded </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> linux </tag>
+        
+          <tag> embedded </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>交叉编译OpenWrt上的Helloworld</title>
+      <url>/2014/08/11/helloworld_on_openwrt/</url>
+      <content type="text">终于编译完成了OpenWrt，并且成功交叉编译了Helloworld，并在Easy-Link的板子上运行。
+
+
+
+#编译OpenWrt SDK#
+
+编译OpenWrt的过程，可参考OpenWrt的编译。编译配置我勾选了Advanced configuration option、Build the OpenWrt SDK和Build the OpenWrt based Toolchain。
+
+编译完成之后，交叉编译工具链在类似staging_dir/toolchain-architecture_gcc-compilerver_uClibc-libcver/bin/目录。
+
+#配置环境变量#
+
+主要配置以下环境变量：
+
+PATH=$PATH:(toolchain/bin目录)
+export PATH
+
+STAGING_DIR=(toolchain目录)
+export STAGING_DIR
+
+
+
+#交叉编译Helloopenwrt#
+
+helloopenwrt.c的源码如下：
+
+#include &amp;lt;stdlib.h&amp;gt;
+
+int main() {
+    printf(&quot;Hello OpenWrt\n&quot;);
+}
+
+
+
+然后进行交叉编译：
+
+architecture-openwrt-linux-uclibc-gcc helloopenwrt.c -o helloopenwrt.o
+
+
+
+然后将生成的hellowopenwrt.o文件用scp上传到Easy-Link上，并用ssh登录到Easy-Link上，并运行，便可以看到终端输出：
+
+Hello OpenWrt
+
+
+</content>
+      <categories>
+        
+          <category> Embedded </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> openwrt </tag>
+        
+          <tag> embedded </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>OpenWrt编译过程中出现的错误</title>
+      <url>/2014/08/11/error_on_compiling_openwrt/</url>
+      <content type="text">编译OpenWrt不是件容易的事情，编译过程中要下载包，并且会出现很多奇怪的错误，经过几个小时的编译，终于成功了。
+
+
+
+错误的捕获可以通过以下命令：
+
+make V=99
+
+
+
+#下载错误#
+
+在编译的过程中，会从网上下载很多源码及包，由于服务器在国外，所以很不稳定，出现下载错误时，你可以多试几次，或者直接下载包放在相应目录。我的解决方法是用代理翻墙到国外下载。
+
+#patch补丁文件错误#
+
+在编译过程中，可能会出现以下的错误：
+
+malformed patch at line xxx
+
+
+
+这是由于应用patch 时都会检查受影响的行数是否与记录在两个 @@ 之间的数值一致，如果不一致的话，就要打开patch文件手动修改那个数值以符合受影响的行数。具体可以参考这里。
+
+#Kconfig错误#
+
+在编译时，可能某个Konfig文件出现以下的错误：
+
+'endif' in different file than 'if'
+location of the 'if'
+
+
+
+这是Kconfig文件出现问题（参考），只要打开相应的Kconfig文件，在他的最后一行加个加车就行了，我也不知道为什么。
+</content>
+      <categories>
+        
+          <category> Embedded </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> openwrt </tag>
+        
+          <tag> embedded </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>OpenWrt的编译</title>
+      <url>/2014/08/10/compile_openwrt/</url>
+      <content type="text">最近在淘宝上买了基于AR9331的Easy-Link模块，尝试着编译了一下OpenWrt，编译环境为ubuntu 12.04。
+
+
+
+#安装组件#
+
+打开终端，安装编译所需的组件：
+
+sudo apt-get install gcc g++ binutils patch bzip2 flex bison make autoconf gettext texinfo unzip sharutils subversion libncurses5-dev ncurses-term zlib1g-dev git-core gawk asciidoc libz-dev
+
+
+
+#下载及更新Openwrt源码#
+
+打开终端，输入下以命令下载源码,当然还可以下载其它的版本，注意不要包含中文路径。
+
+svn co svn://svn.openwrt.org/openwrt/branches/attitude_adjustment
+
+
+
+进入源码目录，更新源码：
+
+svn update
+
+
+
+更新源：
+
+./scripts/feeds update -a
+
+
+
+安装下载好的包：
+
+./scripts/feeds install -a
+
+
+
+#编译配置#
+
+打开终端，输入：
+
+make menuconfig
+
+
+
+打开OpenWrt配置界面进行配置。当然，Easy-Link有自己的补丁包。
+
+如果你想配置内核，可以在终端中输入：
+
+make kernel_menuconfig
+
+
+
+#编译#
+
+在终端中输入：
+
+make -j 2
+
+
+
+其中的2表示用2个线程进行编译，适用于多核CPU。在编译过程中会下载相应的文件，编译完成后，会在bin目录生成固件文件。
+
+如果想清除生成的文件，可在终端中输入：
+
+make clean
+
+
+
+如果想初始化编译环境，可在终端中输入：
+
+make dirclean
+
+
+
+如果想查看编译详细内容，或者捕获错误，可在终端中输入：
+
+make V=99
+
+
+</content>
+      <categories>
+        
+          <category> Embedded </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> openwrt </tag>
+        
+          <tag> embedded </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>VoCore启动成功</title>
+      <url>/2014/08/06/first_start_of_vocore/</url>
+      <content type="text">换了个VoCore板之后，VoCore就能正常启动了，顺便测试了一下ssh和ap+sta模式。
+
+
+
+#SSH连接#
+
+VoCore连上电源后，等待大约30秒之后，便会有发出一个ssid为VoCore的无加密wifi。连上之后，在浏览器输入192.168.1.1，进入Openwrt的Luci界面。
+
+
+
+用户名为root，密码为vocore，登录进去之后，系统会提示修改密码并开启ssh，按照提示操作之后，打开终端，输入：
+
+ssh root@192.168.1.1
+
+
+
+输入密码之后，便可以登录进去了。
+
+#STA+AP模式#
+
+根据作者博客介绍，VoCore的STA和AP能够同时工作。首先，开启STA模式，添加下面内容到｀/etc/config/network`。
+
+config interface wwan
+    option proto 'dhcp'
+
+
+
+然后，修改/etc/config/wireless文件：
+
+config wifi-device  radio0
+	option type     mac80211
+	option channel  11
+	option hwmode	11ng
+	option path	'10180000.wmac'
+	list ht_capab	GF
+	list ht_capab	SHORT-GI-20
+	list ht_capab	SHORT-GI-40
+	list ht_capab	RX-STBC1
+	option htmode	HT20
+
+config wifi-iface
+    option device   radio0
+	option network  lan
+	option mode     ap
+	option ssid     VoCore
+	option encryption none
+
+config wifi-iface
+	option device   radio0
+	option network  wwan
+	option mode     sta
+    option ssid     VongerWifi
+	option encryption psk2
+	option key      PasswordForWifi
+
+
+
+修改相应ssid与密码即可。
+
+如果，你家的路由是用192.168.1.1作它的IP地址，那么为避免冲突，你必须修改VoCore的IP，修改文件里相应的IP，如192.168.61.1。
+
+config interface 'lan'
+	option ifname 'eth0.1'
+	option type 'bridge'
+	option proto 'static'
+	option ipaddr '192.168.61.1'
+	option netmask '255.255.255.0'
+	option ip6assign '60'
+
+
+
+重启连接成功之后，VoCore便可以访问外网了。
+</content>
+      <categories>
+        
+          <category> Embedded </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> vocore </tag>
+        
+          <tag> openwrt </tag>
+        
+          <tag> embedded </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>为Jekyll增加不完美的分页和文章摘要</title>
+      <url>/2014/08/04/paginate_and_excerpt_on_jekyll/</url>
+      <content type="text">怎么说呢，用Jekyll搭建Blog不管被说的多么好用，但终究应该只属于技术宅+爱折腾的群体吧，经常一个Wordpress上的小功能，却要在Jekyll折腾不少时间，比如之前的站内搜索，以及今天的分页以及文章摘要，足足折腾了我一下午，而且最后的解决方案还是不完美，有点小挫败感。
+
+
+
+回到主题，下面先说下Jekyll分页，这个功能有内置的，但是非常见鬼的，只支持对index.html的分页，你没看错，文件名必须是这个，如果你是用JB的话，把index.md重命名成index.html，然后再继续往下看：
+
+修改_config.yml文件，增加
+
+# 每一页显示的文章数
+paginate: 5
+
+
+
+添加了上面后，你就可以在index.html页面中，引用paginator这个对象了，记住，只有index.html页面可以用。
+
+
+变量名	                描述
+paginator.per_page     每页的文章数
+paginator.posts        这个分页下所有的文章列表
+paginator.total_posts  总文章数
+paginator.total_pages  总页数
+paginator.page         当前页
+paginator.previous_page前一页
+paginator.next_page    后一页
+
+
+具体如何使用，参考How pagination works.
+
+前面也提到了，这个只支持首页模式，也就是说，你的Blog里有多个文章类目，然后这个是不支持的，所以我称做为不完美的分页。不过我的Blog文章还少，而且我向来是个比较懒的人，等分类下的文章也多了，再来想怎么解决吧。
+
+下面说说怎么搞文章摘要，如果没有摘要的，列表展示是很头大的。目前有这么几种方法：
+
+
+  
+    用内置的truncate或者truncatewords方法，这个好处是内置的，不需要装插件，不需要装插件意味着你可以在托管Github上用，因为Github上很多插件都不支持。但缺点也很明显，对html的标签支持不是很好，如果你是纯文本的Blog，倒也还好。
+  
+  
+    装truncatehtml插件。这个插件首先需要nokogiri，所以你需要在本地安装，安装命令如下：
+
+    gem install nokogiri
+
+    
+
+    然后再安装上述的插件，这个插件的好处就是对解析后的html代码进行控制，但坏处就是，你如果是托管在Github上，那就悲剧了，不能用。
+  
+
+
+上面两种方法，都有一个问题，就是对所有文章的摘要提取都是一样的，但是有时候，对于不同的问题，我想显示不同长度的摘要，所以下面隆重祭出第三种方法（其实，也是我在网上找的，版权不归我哈）： 
+首先，在你文章里，想要输出摘要的截至地方，打上标签，比如：
+
+ ---
+ title: some post
+ layout: post
+ ---
+
+ 我有一头小毛驴呀，从来也不骑。
+
+ &amp;lt;!--break--&amp;gt;
+
+ 有一天我心血来潮骑它取赶集。  
+
+
+
+然后用下面的方式截取：
+
+  \{\{ post.content  | | split:'&amp;lt;!--break--&amp;gt;' | first \}\}
+
+
+
+这样的方式，就是，你需要在写文章的时候，打一个注释，但是，这个成本，我想，还好吧。
+
+
+
+本文转自：http://kingauthur.info/2013/01/20/the-paginator-and-excerpt-in-jekyll/
+</content>
+      <categories>
+        
+          <category> Jekyll </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> jekyll </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>VoCore首次启动失败</title>
+      <url>/2014/07/31/failed_on_first_start_of_vocore/</url>
+      <content type="text">本来以为首次启动应该顺顺利利的，但是，问题总是在遇到我的时候变得很复杂，问题总是以意思不到的形式出现，接上电源后，竞然搜不到ssid为VoCore的WiFi。
+
+
+
+#VoCore的电源#
+
+如图所示，VoCore输入电源3.3V~6.0V，经MT3410L转换成3.3V，再经MT3410L转成1.8V，给RT5350F供电。因此，只要输入5.0V的USB电源便可以正常运行了。
+
+
+
+本人决定用Mini USB线来改装。Mini USB有4条线，分别是红、白、绿、蓝（黑），其中红是正极，蓝（黑）是地，将这两根线接到图中红框所示的地方，便可以正常启动。
+
+
+
+
+
+#问题出现#
+
+接上5V USB电源之后，LED亮了大约1秒，之后，大约隔18秒之后，led亮了大约15秒，之后，又等了好久，始终看不到VoCore的Wifi出现。询问作者Vonger，Vonger表示led正常，要求给出USB-TTL的Log进行分析，所以又制作了VoCore的USB-TTL。
+
+#USB-TTL输出#
+
+依照Vonger博客上的方法，使用USB-TTL模块，并将相应引脚接到红框部分。
+
+
+
+
+
+电脑端的串口调试客户端，我用的是putty，相关的串口参数如下：
+
+
+  波特率57600
+  数据位8位
+  无校验位
+  停止位1位
+
+
+之后，便可以打印出log信息。
+</content>
+      <categories>
+        
+          <category> Embedded </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> vocore </tag>
+        
+          <tag> openwrt </tag>
+        
+          <tag> embedded </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>入手VoCore</title>
+      <url>/2014/07/30/get_vocore/</url>
+      <content type="text">由于项目需要用到RT5350，一个廉价的WiFi片上芯片，在网上搜索相关资料之后，找到了VoCore这个国内的开源项目，一个带用WiFi的硬币大小的Linux计算机。如果感兴趣的话可以了解一下作者的博客和相关介绍。
+
+
+
+
+  #什么是VoCore？#
+  VoCore是运行OpenWrt的开源硬件。尽管WIFI, USB, UART, 20+ GPIO一应俱全，但是大小为1英寸（25mm x 25mm）。它提供了很多的接口，比如说10/100M以太网口、USB、UART、I2C、I2S、PCM、JTAG和超过20个的GPIO口。
+
+
+正如你所看到的，VoCore非常地小，接口也非常密，这个版本没有提代外接的天线，直接用贴片的天线。
+
+
+
+
+
+以下是它的接口/引脚图，接口非常的丰富，使用必须用电烙铁焊上去。
+
+
+
+作者除了本身的博客之外，不提供其它的资料，所示还是先看看他的博客吧。
+</content>
+      <categories>
+        
+          <category> Embedded </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> vocore </tag>
+        
+          <tag> openwrt </tag>
+        
+          <tag> embedded </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>在Jekyll上使用分页</title>
+      <url>/2014/07/26/pagination_on_jekyll/</url>
+      <content type="text">一个博客不可能只有几篇文章，如果所有文章全部放在一个页面中，在文章不多的情况下也许较为直观，一旦文章数量增加，不仅加大了用户需要加载的数据量，也为用户检索文章造成了障碍，所以基本上每个博客都会有文章的分页。一般的分页都是通过像JSP的模板引擎直接在从数据库中分页取出时生成动态生成页面，或者通过ajax从数据库分页取出传递到前端。但现在github+jekyll是静态的页面，没有数据库。好在jekyll支持分页功能。
+
+
+
+#开启分页功能#
+
+首先我们需要在jekyll中开启分页功能，在jekyll的_config.yml中加入分页配置：
+
+paginate: 5
+paginate_path: &quot;page:num&quot;
+
+
+
+第一行定义了每页的文章数量，而第二行则定义了在分页的结果，比如在/index.html中使用分页，定义为page:num，则第二页的路径将是/page2/index.html，第三页的路径将是/page3/index.html，以此类推。
+
+需要注意的几个点：
+
+
+  分页只在html文件中起作用
+  paginate_path同时定义了需要被分页的文件，本人测试这个叫index.html，具体目录由paginate_path中的路径定义，如果定义的目录没有，则会向上寻找index.html，直到根目录的index.html，具体机制官网上没有详细说，所以还需要进一步实验
+
+
+#使用分页#
+
+只是开启了分页还没有用，我们需要确实使用到首页之中，在首页(/index.html)中添加如下代码：
+
+这样，jekyll就会根据paginator来进行分页了，被分出来多少页，就会有多少个页面生成。排1-5的文章就在/index.html中了，而排6-10的文章则在/page2/index.html中，依次类推。
+
+#换页#
+
+只是分页还不够，我们还需要在每个页面上做一个跳转到其他页面的导航，这里需要用到paginator的一些其他属性。
+
+首先检测总的页数，如果只有一页，自然就不需要分页了。通过paginator的total_pages属性能判断总页数：
+
+{% if paginator.total_pages &amp;gt; 1 %}
+&amp;lt;!-- 分页代码 --&amp;gt;
+{% endif %}
+
+
+
+我们需要一个跳转到上一页的按钮，这个按钮在第一页不需要显示，通过paginator的previous_page属性来判断是否是第一个页面，使用paginator的previous_page_path来输出上一页的路径，注意在前面添加baseurl，并进行一些必要的字符替换：
+
+{% if paginator.previous_page %}
+    &amp;lt;a href=&quot;{{ paginator.previous_page_path | prepend: site.baseurl | replace: '//', '/' }}&quot;上一页&amp;lt;/a&amp;gt;
+{% endif %}
+
+
+
+接着是生成所有页面的按钮，并使当前页按钮无效化，遍历所有页面，使用paginator的page属性来确定当前页，如果是当前页，则按钮无效，否则使用{{ site.paginate_path | prepend: site.baseurl | replace: '//', '/' | replace: ':num', page }}来将:num替换成当前页面的数字生成页面路径：
+
+{% for page in (1..paginator.total_pages) %}
+    {% if page == paginator.page %}
+      &amp;lt;span class=&quot;active&quot;&amp;gt;{{ page }}&amp;lt;/span&amp;gt;
+    {% elsif page == 1 %}
+      &amp;lt;a href=&quot;{{ '/index.html' | prepend: site.baseurl | replace: '//', '/' }}&quot;&amp;gt;{{ page }}&amp;lt;/a&amp;gt;
+    {% else %}
+      &amp;lt;a href=&quot;{{ site.paginate_path | prepend: site.baseurl | replace: '//', '/' | replace: ':num', page }}&quot;&amp;gt;{{ page }}&amp;lt;/a&amp;gt;
+    {% endif %}
+{% endfor %}
+
+
+
+最后生成一个下一页的按钮，在最后一页不显示，和上一页按钮类似，通过paginator的next_page_path来确定是否还有下一页：
+
+{% if paginator.next_page %}
+    &amp;lt;a href=&quot;{{ paginator.next_page_path | prepend: site.baseurl | replace: '//', '/' }}&quot;&amp;gt;下一页&amp;lt;/a&amp;gt;
+{% endif %}
+
+
+
+这样一个完整的分页导航功能就做好了，效果就和博客主页上的分页效果是一样的。
+
+#总结#
+
+jekyll的分页总的来说还算给力，基本的功能可以完成。但是有一些缺陷，就是category，tag的分类分页无法实现，必须通过插件的方式来做。但是github不允许三方插件，所以只能通过一些其他的方式实现了。
+
+
+
+本文转自：http://blog.segmentfault.com/skyinlayer/1190000000406015
+</content>
+      <categories>
+        
+          <category> Jekyll </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> jekyll </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>Marvell88W8686的SPI主控接口</title>
+      <url>/2014/04/20/Marvell88W8686_SPI_Interface/</url>
+      <content type="text">88w8686 是一款低成本、低功耗，支持IEEE 802.11a/g/b MAC/基带/射频(RF)无线局域网标准的片上系统,设计支持IEEE 802.11a/g标准的6、
+9、12、18、24、36、48、54M 有效数据速率，和IEEE 802.11 b 标准的1、2、5.5、11 M 数据速率。88w8686 提供IEEE802.11/802.11 b 标准直接序列扩散光谱(DSSS),802.11a/ g 正交频分复用(OFDM)基带调制,媒体访问控制(MAC),CPU,内存,主机接口,直接转换收音机,无线局域网射频(RF）功能相结合的单一集成芯片。
+
+
+
+88w8686 核心功能单元,通过一个高通量互联系统相互连接，如图所示。
+
+
+
+88W8686 配备了一个完全集成的射频到基带收发器工作在2.4 GHz 的ISM 的802.11g/b端口WLAN应用和5 GHz的UNII WLA 802.11a的无线电波段的无线电波段。该收发器架构包括Marvell的第二代，专门设计用于手机通信。蜂窝频段发射杂散音，噪音和接收干扰被设计在其中。
+
+在手机中由于非常低的频谱发射接收频段，设备不会干扰手机接收和发送高
+功率移动电话传输信号。为了获得最佳性能，接收路径上集成的LNA 和AGC 增益调整无缝控制基带功能。整个接收路径已超过90 分贝电压增益。
+
+综合发射机正交基带信号转换，然后为2.4 GHz 和5 GHz 无线电频带传输提供外部功率放大器的RF 信号。
+
+本振频率产生一个完全集成的可编程频率合成器，无需任何外部元件。环路
+带宽优化相位噪声和动态效能集中在该芯片上。出于安全考虑，88W8686 支持IEEE 802.11i 安全标准，通过实施高级加密标准（AES）/计数器模式CBC - MAC 协议（CCMP），有线等效保密（WEP）临时密钥完整性协议（TKIP）安全机制。为视频，语音，和多媒体应用，88W8686 支持802.11e 的质量服务（QoS）。还支持蓝牙共存接口。88W8686 支持一个通用的SPI（G - SPI）和SDIO 主机接口，采用QFN 封装或倒装芯片封装。
+
+#88W8686 G-SPI主控接口#
+
+88W8686主机接口单元(Host Interface Unit,HIU)连接几个主机接口总线单元到设备(指88W8686)的内部总线上。每个HIU和其他HIU是通过共享到内部总线的连接，但88W8686每次只允许一个HIU被激活。
+
+88W8686的HIU支持G-SPI(通用的SPI)接口和SDIO接口。它支持一个通用的、半双工(half-duplex)、DMA辅助(DMA-assisted)的SPI接口，允许一个主控制器使用通用的SPI协议来访问WLAN设备(指88W8686)。G-SPI接口包含了外部SPI总线和内部共享总线之间的接口电路，如图所示：
+
+
+
+88W8686在SPI总线上表示为设备，主机单元能够直接访问G-SPI寄存器和通过使用BARs(Base Address Register，基地址寄存器)和DMA引擎来访问设备的共享内存。
+
+SPI单元支持通用的SPI接口协议，工作速率可达50MHz，此接口支持下面的功能：
+
+
+  SPI单元总线设备操作
+  SPI单元寄存器读写
+  对内部CPU产生中断
+  对外部SPI主控制器产生中断(比如S3C2451的SPI控制器)
+  通过DMA访问内部共享内存
+  对电源管理单元产生唤醒中断
+
+
+G-SPI接口信号描述
+
+88W8686复位后，紧接着使用下面配置输入引脚来设置参数，但是在88W8686复位到一定时间之后，这些引脚立刻改为变他们通常的功能，比如GPIO[5]就作为通常的功能使用。如果要设置一个配置位为0，通过连接一个阻值为100 kΩ的下拉电阻，比如：
+
+
+
+如果要设置一个配置位为1，则不需要接外部电路
+
+
+
+88W8686的配置引脚如下图所示：
+
+
+
+接下来看G-SPI接口引脚的说明：
+
+
+
+#G-SPI接口功能描述#
+
+G-SPI接口的标准G-SPI物理总线上支持多种简单的地址/数据协议，这些协议通过地址的位数和数据的顺序来区分。
+
+每次通讯由主机通过拉低SCSn信号来发起，从机在检测到SCSn有效(低电平)之后，在每个SCLK的上升沿锁存SDI引脚上输入的数据。当从机要输出数据时，在SCLK的下降沿送出数据。SCLK输入信号在每次通讯的开始和结束都为低电平，中断输入信号SINTn由设备发送给主机(比如S3C2451的SPI主控制器)
+
+##通讯时延(transaction delay)##
+
+第一个数据块是从主机发送到设备(从机)的，这个数据块包含一个地址和读/写标志，地址的最高位(MSB)如果为0表示读，如果为1表示写。
+
+
+  写操作时延(write Write Transaction Delay)
+    
+      对于写操作，写操作的数据段紧跟着地址段，地址和数据段之间，不需要主机产生低时钟脉冲。
+    
+  
+  
+    读操作时延(read Write Transaction Delay)
+
+    
+      读操作时，在总线上地址段之后和数据段之前要求有一些时延。这些时延表现为TDDR(time delay read register，读寄存器时延)和TDRP(timedelay read port，读端口时延)，这些时延表示设备需要需要一些时间来准备有效数据给主机。
+    
+  
+
+
+有两种方式来建立这些时延：
+
+
+  第一种：主机通过发送一定数量的虚拟时钟周期(a known number of dummyclock cycles)到设备来创建读操作时延，这些虚拟时钟周期定义在延迟读寄存器(delay readregister)中，也就是说主机要发送的虚拟时钟周期数量由延迟读寄存器的值来定，下面来看此寄存器的定义：
+
+
+
+
+由上图可知Delay Method的值由SPU Bus Mode寄存器(offset 0x70[2]=1)的Delay_Method位的值来决定，下面来看此寄存器的定义：
+
+
+
+SPU(SPI host interface unit)表示SPI主机接口单元。
+
+
+  第二种：通过主机在地址段和数据段之间保持(holding)低时钟信号至少一段时间来创建读操作时延(the delay is created bythe host holding the clock signal low for a minimum period of time between the addressand data phases)，此模式通过设置0x70[2]=0来选择。
+
+
+在读操作的数据段区间，主机继续提供时钟脉冲和同时驱动数据到SDI输入引脚或从SDO输出引脚读取数据。
+
+##数据传输##
+
+主机经常访问G-SPI单元的配置寄存器，为了访问内部内存空间，一些寄存器被定义为端口寄存器。当访问端口寄存器时，从机使用相应的基地址寄存器(BAR)和DMA引擎来从内部内存空间读取数据，或是写入数据内部内存空间。
+
+主机和从机间的每一次传输都是突发模式(一个地址后面跟着多个数据)，在读或写完所要求数量的数据后，主机通过拉高SCSn引脚来结束此次传输。
+
+###端口寄存器访问####
+
+主机读端口寄存器时，对于突发模式的数据长度没有限制(除了内部总线的有效地址范围限制之外)。主机写端口寄存器时，对突发模式的数据长度唯一要求是：长度是DWORDS的倍数。
+
+端口寄存器(I/O端口，命令端口，数据端口)被用来访问内部32-bit存储空间和总是32-bit对齐访问。每个端口寄存器都有一个相应的BAR用来读写(BAR作为一个指针指向要读写的内存空间的开始物理地址)。内存也只能32-bit对齐访问，这通过向相应的BAR写入32-bit对齐的数据来是实现，在访问期间，第16bits数据总线最先出现在总线上。
+
+
+  
+    写数据到端口寄存器
+
+    
+      写数据到端口寄存器，就是依次填满起始位置在BAR的连续的32-bit内存空间。当从从机的数据和命令端口读数据时，DMA引擎连续填充FIFO知道剩余空间不足8个DWORDs。当写数据到设备时，拉高SCSn信号脚来清空FIFO。
+    
+  
+  
+    从端口寄存器读数据
+
+    
+      当从设备的I/O端口读数据时，可以选择DMA引擎是执行单一读或是突发模式读。突发模式读与读端口和命令端口一样，单一模式读让DMA引擎在内部总线上指向单个DWORD访问。单一模式读通讯必须在返回数据的第一或是第二个16-bit块之后终止。
+    
+  
+
+
+###配置寄存器访问###
+
+当主机访问端口寄存器之外的其他寄存器时，突发模式长度必须限制在一个16-bit的数，或是如果地址是以DWORD边界对齐的两个16-bit数。当内部总线的单元访问G-SPI接口寄存器，则必须是单个DWORD或是更小来访问。
+
+G-SPI除了端口寄存器之外的接口寄存器，都能以16-bit边界对齐的方式读或是写。当单个16-bit word被读出或写入，通讯可以被终止。
+
+##G-SI时钟频率##
+
+G-SPI时钟频率不能大于内部总线时钟频率的2.5倍，内部总线时钟频率
+
+
+
+##数据格式##
+
+总共有16个有效数据格式，下面9个数据格式是可用的：
+
+
+  所有4读数据格式，在地址段和数据段之间的延迟时间，时钟信号保持为低电平。
+  所有4个写数据格式。
+  1个读数据格式，在地址段和数据段之间的延迟时间，时钟信号切换为固定数量的周期。
+
+
+每种读写操作类型都有两种地址长度，要么是8-bit要么是16-bit，而每种地址长度对应有两种数据顺序。
+
+###可编程的时钟周期延迟###
+
+下面是Delay_Method=0的读数据格式，在这种模式下，tdr(r/p)的值代表最后一个地址位和第一个数据位之间的延时时间，这段时间内时钟信号SCLK保持为低电平。有两个不同的延时值，包括从G-SPI配置寄存器读取的值和从G-SPI端口寄存器读取的值。一旦读写操作指定的时延期满，有效的数据就从设备中发出。
+
+
+  
+    读数据格式
+
+    
+  
+  
+    写数据格式
+
+    
+  
+
+
+###固定的时钟周期延迟###
+
+下面是读数据格式的例子：
+
+
+
+目前我们G-SPI驱动读数据格式就是采用这种格式。
+
+##G-SPI接口寄存器内存空间##
+
+
+
+
+
+本文章转自：http://blog.csdn.net/loongembedded/article/details/9067013
+</content>
+      <categories>
+        
+          <category> Embedded </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> embedded </tag>
+        
+          <tag> 88w8686 </tag>
+        
+          <tag> wifi </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>批量删除Kindle云端的个人文档</title>
+      <url>/2014/04/18/delete_document_on_kindle_cloud/</url>
+      <content type="text">在使用Kindle的推送时，有一个不好的地方就是，推送的电子书会被放到云端，而且要删除的话不能批量删，长年累月就积累了一大批。本人找到一种方法可以批量删除当前个人文档页面的电子书。
+
+
+
+首先，登录amazon，并点击个人文档，将以下代码复制进地址栏中：
+
+javascript:(function(){ var v = new RegExp(&quot;PersonalDocuments&quot;); if (!v.test(document.URL)) { return false; } {a=document.getElementsByClassName('rowBodyCollapsed');for(var i = 0; i&amp;lt;a.length; i++){Fion.deleteItem('deleteItem_'+a[i].getAttribute('asin'));};return; }})();
+
+
+
+按回车后，便会删除当前页面的电子书。当然，你也可以在搜索框搜索电子书，再输入以上代码删除搜索结果页面的电子书。
+
+这里有一个要注意的地方，如果你使用的浏览器是chrome的话，以上代码复制进地址栏时，javascript这个关键字会被注释掉，可以复制进地址栏之后，再在前面添加javascript关键字。当然，你也可以按F12进入打开开发者工具，再点击Console,再输入以上代码。
+</content>
+      <categories>
+        
+          <category> Daily </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> kindle </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>sk_buff结构分析</title>
+      <url>/2014/04/16/sk_buff_analysis/</url>
+      <content type="text">在wlan驱动中，数据读取写入是通过sk_buff这个结构体，而sk_buff结构主要作用是包含接收的缓冲数据，和它的包头信息。
+
+
+
+如下是sk_buff的主要结构成员：
+
+struct sk_buff {
+...
+	unsigned char *head;
+	unsigned char *data;
+	unsigned char *tail;
+	unsigned char *end;
+...
+};
+
+
+
+当然，sk_buff还包含一些链表的东西，在此处并不做解析。在以上结构体中：
+
+
+  head：报文缓冲区的头；
+  data：数据的头指针；
+  tail：数据的尾指针；
+  end ：报文缓冲区的尾部。
+
+
+如图所示，
+
+
+
+分别有三个空间：head room、packet data、tail room。其中packet data是数据所在区包括数据的包头，head room是数据头部增长的预留空间、tail room是尾部增加的空间。预留头部使用skb_reserve(skb, header_len);函数，尾部增加使用skb_put()，头部增长使用skb_push()。
+
+以下图是调用分配空间函数，即初始化函数alloc_skb(len, GFP_KERNEL)的样子：
+
+
+
+可以看到，head、data和tail都指向了缓冲区的起始，而end指向结束。这个SKB的数据长度为0，不包含任何数据。
+
+接着调用了skb_reserve(skb, header_len)预留了头部数据，如图所示：
+
+
+
+通过调用skb_put()向尾部增长数据，如图所示：
+
+
+
+通过调用skb_push()向头部增长数据，如图所示，增加了一个UDP头：
+
+
+
+
+
+本文考参：http://vger.kernel.org/~davem/skb_data.html
+</content>
+      <categories>
+        
+          <category> Linux </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> linux </tag>
+        
+          <tag> driver </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>QF9700 Linux 3.0.8驱动补丁</title>
+      <url>/2014/04/15/qf9700_for_linux_3.0.8/</url>
+      <content type="text">网上有QF9700/RD9700的开源驱动，点此下载。但是最高只支持Linux 2.6.32，在Linux 3.0.8编译下会出现错误，如下：
+
+
+
+Building QF9700 USB2NET chip driver...
+make[1]: 正在进入目录 `/home/snail/文档/Project/FriendlyArm/linux-3.0.8'
+  CC [M]  /home/snail/文档/Project/FriendlyArm/qf9700-2.6.32/qf9700/qf9700.o
+/home/snail/文档/Project/FriendlyArm/qf9700-2.6.32/qf9700/qf9700.c: In function 'qf9700_set_multicast':
+/home/snail/文档/Project/FriendlyArm/qf9700-2.6.32/qf9700/qf9700.c:356:45: error: 'struct net_device' has no member named 'mc_count'
+/home/snail/文档/Project/FriendlyArm/qf9700-2.6.32/qf9700/qf9700.c:358:16: error: 'struct net_device' has no member named 'mc_count'
+/home/snail/文档/Project/FriendlyArm/qf9700-2.6.32/qf9700/qf9700.c:359:36: error: 'struct net_device' has no member named 'mc_list'
+/home/snail/文档/Project/FriendlyArm/qf9700-2.6.32/qf9700/qf9700.c:362:22: error: 'struct net_device' has no member named 'mc_count'
+/home/snail/文档/Project/FriendlyArm/qf9700-2.6.32/qf9700/qf9700.c:362:56: error: dereferencing pointer to incomplete type
+/home/snail/文档/Project/FriendlyArm/qf9700-2.6.32/qf9700/qf9700.c:363:14: error: dereferencing pointer to incomplete type
+make[2]: *** [/home/snail/文档/Project/FriendlyArm/qf9700-2.6.32/qf9700/qf9700.o] 错误 1
+make[1]: *** [_module_/home/snail/文档/Project/FriendlyArm/qf9700-2.6.32/qf9700] 错误 2
+make[1]:正在离开目录 `/home/snail/文档/Project/FriendlyArm/linux-3.0.8'
+make: *** [all] 错误 2
+
+
+
+为此，写了一个补丁。
+
+diff -ur b/qf9700.c a/qf9700.c
+--- b/qf9700.c	2011-01-21 17:59:58.000000000 +0800
++++ a/qf9700.c	2014-04-15 18:37:50.000000000 +0800
+@@ -353,14 +353,13 @@
+ 
+ 	if (net-&amp;gt;flags &amp;amp; IFF_PROMISC) {
+ 		rx_ctl |= 0x02;
+-	} else if (net-&amp;gt;flags &amp;amp; IFF_ALLMULTI || net-&amp;gt;mc_count &amp;gt; QF_MCAST_MAX) {
++	} else if (net-&amp;gt;flags &amp;amp; IFF_ALLMULTI || netdev_mc_count(net) &amp;gt; QF_MCAST_MAX) {
+ 		rx_ctl |= 0x04;
+-	} else if (net-&amp;gt;mc_count) {
+-		struct dev_mc_list *mc_list = net-&amp;gt;mc_list;
+-		int i;
++	} else if (netdev_mc_count(net)) {
++		struct netdev_hw_addr *hw_addr;
+ 
+-		for (i = 0; i &amp;lt; net-&amp;gt;mc_count; i++, mc_list = mc_list-&amp;gt;next) {
+-			u32 crc = ether_crc(ETH_ALEN, mc_list-&amp;gt;dmi_addr) &amp;gt;&amp;gt; 26;
++		netdev_for_each_mc_addr(hw_addr, net) {
++			u32 crc = ether_crc(ETH_ALEN, hw_addr-&amp;gt;addr) &amp;gt;&amp;gt; 26;
+ 			hashes[crc &amp;gt;&amp;gt; 3] |= 1 &amp;lt;&amp;lt; (crc &amp;amp; 0x7);
+ 		}
+ 	}
+@@ -413,9 +412,9 @@
+ 
+ 	/* power up and reset phy */
+ 	qf_write_reg(dev, PRR, 1);
+-	udelay(20 * 1000);	// at least 10ms, here 20ms for safe
++	mdelay(20);	// at least 10ms, here 20ms for safe
+ 	qf_write_reg(dev, PRR, 0);
+-	udelay(2 * 1000);	// at least 1ms, here 2ms for reading right register
++	mdelay(2);	// at least 1ms, here 2ms for reading right register
+ 
+ 	/* receive broadcast packets */
+ 	qf9700_set_multicast(dev-&amp;gt;net);
+diff -ur b/qf9700.h a/qf9700.h
+--- b/qf9700.h	2010-10-09 16:51:00.000000000 +0800
++++ a/qf9700.h	2014-04-15 17:20:23.000000000 +0800
+@@ -150,4 +150,21 @@
+ #define	QF_TX_OVERHEAD		2	// 2bytes header
+ #define	QF_RX_OVERHEAD		7	// 3bytes header + 4crc tail
+ 
++#ifdef DEBUG
++#define devdbg(usbnet, fmt, arg...) \
++        printk(KERN_DEBUG &quot;%s: &quot; fmt &quot;\n&quot; , (usbnet)-&amp;gt;net-&amp;gt;name , ## arg)
++#else
++#define devdbg(usbnet, fmt, arg...) \
++        ({ if (0) printk(KERN_DEBUG &quot;%s: &quot; fmt &quot;\n&quot; , (usbnet)-&amp;gt;net-&amp;gt;name , \
++                ## arg); 0; })
++#endif
++
++#define deverr(usbnet, fmt, arg...) \
++        printk(KERN_ERR &quot;%s: &quot; fmt &quot;\n&quot; , (usbnet)-&amp;gt;net-&amp;gt;name , ## arg)
++#define devwarn(usbnet, fmt, arg...) \
++        printk(KERN_WARNING &quot;%s: &quot; fmt &quot;\n&quot; , (usbnet)-&amp;gt;net-&amp;gt;name , ## arg)
++
++#define devinfo(usbnet, fmt, arg...) \
++        printk(KERN_INFO &quot;%s: &quot; fmt &quot;\n&quot; , (usbnet)-&amp;gt;net-&amp;gt;name , ## arg); \
++
+ /*----------------------------------------------------------------------------------------------*/
+
+
+
+点此下载源文件及补丁文件。
+</content>
+      <categories>
+        
+          <category> Linux </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> linux </tag>
+        
+          <tag> driver </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>Marvel 88w8686 Linux驱动分析</title>
+      <url>/2014/04/14/marvel_88w8686_wifi_linux_driver_analysis/</url>
+      <content type="text">由于编写Marvel 88w8686 wlan模块SPI接口的stm32驱动的需要，对Marvel 88w8686 Linux SPI接口的驱动进行了分析和参考。
+
+
+
+#Marvel驱动的使用#
+
+88w8686的Linux驱动是通过模块方式载入内核的，在使用时加载进去就行了，88w8686的Linux驱动还包含了sdio的驱动，加载时，还必须加载sdio驱动。在运行make命令进行编译后，会生成sdio.o和sd8386.o文件，在终端下输入下列命令进行加载：
+
+insmod sdio.o
+insmod sd8385.o
+
+
+
+#Marvel驱动源码分析#
+
+了解完如何使用Marvel 88w8686 Linux驱动后，便可以进行驱动源码的分析。源码点击此处下载。
+
+##源码目录结构##
+
+源码的目录结构如下：
+
+.
+├─app
+│  └─wlanconfig
+├─config
+├─if
+│  └─if_gspi
+├─io
+│  └─gspi
+│      └─pxa270
+├─os
+│  └─linux
+└─wlan
+
+
+
+其中app文件夹是驱动自带的wlanconfig工具，用于配置wifi的参数，本文不进行分析。config文件夹包含的是一些配置文件，不进行分析。if文件夹包含的是关于GSPI操作的接口，包括固件。io文件夹包含的是GSPI驱动。os文件夹包含的是与系统相关的操作与头文件。wlan文件夹是wifi驱动的主要目录，在本文进行重点分析。
+
+##驱动的启动流程##
+
+由上文可知，wlan驱动是通过insmod进加载的。在文件wlan/wlan_main.c末尾处可以看到：
+
+module_init(wlan_init_module);
+module_exit(wlan_cleanup_module);
+
+MODULE_DESCRIPTION(&quot;M-WLAN Driver&quot;);
+MODULE_AUTHOR(&quot;Marvell International Ltd.&quot;);
+
+
+
+这几个宏说明了wlan驱动模块的入口，知道其初始化函数是wlan_init_module。
+
+再来看看wlan_init_module函数，在其函数中，调用了以下函数对网卡插入和移除时调用的函数进行了注册，即当电脑检测到网卡时有调用wlan_add_card。
+
+sbi_register(wlan_add_card, wlan_remove_card, NULL)
+
+
+
+在wlan_add_card中，进行初始化后，以下函数启动了内核主线程wlan_service_main_thread。
+
+wlan_create_thread(wlan_service_main_thread, &amp;amp;priv-&amp;gt;MainThread, &quot;wlan_main_service&quot;)
+
+
+
+###内核主线程###
+
+内核主线程wlan_service_main_thread承担了wlan驱动的主要工作，它主要是处理wlan固件的事件，wlan固件接受到的数据和内核传来的数据。
+
+在wlan_service_main_thread函数中有一个for死循环，所有数据处理都在循环里面。
+
+在主循环里面，首先调用：
+
+OS_SET_THREAD_STATE(TASK_INTERRUPTIBLE);
+...
+schedule();
+
+
+
+让主线程进入可中断的等待模式，等到事件到来。当主线程被唤醒时，即有数据要处理，便调用：
+
+sbi_get_int_status(priv, &amp;amp;ireg)；
+...
+Adapter-&amp;gt;HisRegCpy |= ireg;
+
+
+
+先读取网卡固件发来的数据及标志位，将标志位存入Adapter-&amp;gt;HisRegCpy。
+
+紧接着便对标志位进行判断：
+
+/* Command response? */
+if (Adapter-&amp;gt;HisRegCpy &amp;amp; HIS_CmdUpLdRdy) {
+	PRINTM(INFO, &quot;main-thread: Cmd response ready.\n&quot;);
+
+	OS_INT_DISABLE;
+	Adapter-&amp;gt;HisRegCpy &amp;amp;= ~HIS_CmdUpLdRdy;
+	OS_INT_RESTORE;
+
+	wlan_process_rx_command(priv);
+}
+
+/* Any received data? */
+if (Adapter-&amp;gt;HisRegCpy &amp;amp; HIS_RxUpLdRdy) {
+	PRINTM(INFO, &quot;main-thread: Rx Packet ready.\n&quot;);
+	
+	OS_INT_DISABLE;
+	Adapter-&amp;gt;HisRegCpy &amp;amp;= ~HIS_RxUpLdRdy;
+	OS_INT_RESTORE;
+
+	wlan_send_rxskbQ(priv);
+}
+
+/* Any Card Event */
+if (Adapter-&amp;gt;HisRegCpy &amp;amp; HIS_CardEvent) {
+	PRINTM(INFO, &quot;main-thread: Card Event Activity.\n&quot;);
+
+	OS_INT_DISABLE;
+	Adapter-&amp;gt;HisRegCpy &amp;amp;= ~HIS_CardEvent;
+	OS_INT_RESTORE;
+
+	if (sbi_read_event_cause(priv)) {
+		PRINTM(MSG, &quot;main-thread: sbi_read_event_cause failed.\n&quot;);
+		continue;
+	}
+	wlan_process_event(priv);
+}
+
+
+
+并且调用相应的处理函数，对数据进行处理。
+
+当然进程中还对wlan的PS（Power Save）模式和WMM（WiFi-MultiMedia）进行判断处理，本文不进行分析。
+
+接着，便对内核发来的命令进行处理（比如说连接命令，扫描命令）：
+
+/* Execute the next command */
+if (!priv-&amp;gt;wlan_dev.dnld_sent &amp;amp;&amp;amp; !Adapter-&amp;gt;CurCmd) {
+	ExecuteNextCommand(priv);
+}
+
+
+
+当然，之后便进入等待事件状态，重复以上过程。
+
+###wlan固件数据/事件###
+
+当wlan固件有数据/事件时，GSPI驱动会产生中断，它的中断处理函数为sbi_interrupt，在sbi_interrupt中调用了wlan_interrupt,在wlan_interrupt中，调用
+
+wake_up_interruptible(&amp;amp;priv-&amp;gt;MainThread.waitQ);
+
+
+
+唤醒了主线程，对数据进行处理。上面介绍过，主线程调用sbi_get_int_status(priv, &amp;amp;ireg)读取数据和标志位。
+
+###应用层调用驱动接口###
+
+该wlan驱动接口是wext（Wireless Extensions无线扩展接口）。wext的接口实现上，应用层采用ioctl方式访问驱动，设置无线参数或者获取无线参数，配置无线驱动进行联网操作。无线驱动事件到应用层的传递采用的netlink socket技术，一种netlink route消息技术。这也是很多其他类型的驱动标准的实现方法。具体调用方法可以参考wlanconfig，比如说
+
+ioctl(sockfd, SIOCGIWSCAN, &amp;amp;iwr));
+
+
+
+调用wlan驱动扫描命令。如下函数
+
+s = socket(PF_INET, SOCK_DGRAM, 0);
+
+
+
+新建了一个netlink连接。
+
+所有的ioctl的回调函数在，wlan_wext.c的wlan_handler数组中，这里对SIOCGIWSCAN即wlan扫描进行分析。可以看到wlan扫描的回调函数是wlan_get_scan和wlan_set_scan。
+
+先来看看wlan_set_scan，在wlan_set_scan函数中又调用了wlan_scan_networks,在wlan_scan_networks中调用了wlan_scan_channel_list将命令添加到命令队列中，并等待命令执行响应，然后调用wlan_scan_process_results更新priv中的扫描表。
+
+在函数wlan_scan_channel_list中调用PrepareAndSendCommand将命令添加到命令列表。等发送到固件的数据和固件发送过来的数据都存在CmdNode-&amp;gt;BufVirtualAddr指针指向的数据中，接着调用
+
+QueueCmd(Adapter, CmdNode, TRUE);
+wake_up_interruptible(&amp;amp;priv-&amp;gt;MainThread.waitQ);
+
+
+
+将命令加入命令队列，接着唤醒主线程处理命令，然后执行如下函数
+
+wait_event_interruptible(CmdNode-&amp;gt;cmdwait_q, CmdNode-&amp;gt;CmdWaitQWoken);
+
+
+
+等待结果，当CmdNode-&amp;gt;CmdWaitQWoken为TRUE时唤醒。
+
+在主线程中，由上面知道，调用ExecuteNextCommand执行内核发来的命令。在ExecuteNextCommand函数中调用DownloadCommandToStation下载命令，DownloadCommandToStation中，先调用sbi_host_to_card下载命令，然后调用ModTimer进行超时时重新发送。
+
+接下来，便是等待响应，当固件对发来的命令响应时，会触发中断，如上文说的调用wlan_process_rx_command处理固件对命令的响应。在wlan_process_rx_command中处理完成之后，会调用CleanupAndInsertCmd回收命令，此时的CmdNode-&amp;gt;CmdWaitQWoken为TRUE，下次schedule时便，唤醒上面等待命令响应的线程，让其继续执行。
+
+整个驱动运行的流程便是这样子。
+</content>
+      <categories>
+        
+          <category> Linux </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> wifi </tag>
+        
+          <tag> linux </tag>
+        
+          <tag> driver </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+    <entry>
+      <title>强化你的Terminal IDE——在android平板/手机上编写C/C++</title>
+      <url>/2012/11/24/c_on_android/</url>
+      <content type="text">Terminal IDE是一个可扩展的终端应用，其包含了全功能的Java/HTML/Android开发套件。Terminal IDE集成了VIM, ssh, git等多个功能，其中强大之处，大家自己发觉，如果你用惯了Linux下的shell命令，那么用Terminal IDE你将会得心应手，喜欢上它的。
+
+
+
+虽然Terminal IDE很强大，可以编写Java，android，但它没有gcc/g++。没关系，Terminal IDE强大之处就在于它是可拓展的，具体可以看它的Help。此处，我说明一下，如何把gcc/g++加入Terminal IDE，其实就是将linux-arm-gcc加入Terminal IDE 。
+
+首先，将linux-arm-gcc解压到Terminal IDE中的~/system目录下(不是系统的/system/，其真正目录为:data/data/com.spartacusrex.spartacuside/files/system)。
+
+修改该’gcc’目录为可读写，在Terminal IDE下执行
+
+chmod -R 777 ./gcc
+
+
+
+修改~(即data/data/com.spartacusrex.spartacuside/files/)目录下的.bashrc文件。添加需要的环境变量，在~/.bashrc文件添加如下环境变量：
+
+export CPLUS_INCLUDE_PATH=$IDESYSTEM/gcc/arm-linux-androideabi/c++/include:$CPLUS_INCLUDE_PATH
+export C_INCLUDE_PATH=$IDESYSTEM/gcc/arm-linux-androideabi/include:$C_INCLUDE_PATH
+export PATH=$IDESYSTEM/gcc/bin:$PATH
+
+
+
+将gcc/bin下的相应文件改一下名，改为gcc和g++。
+
+再重启Terminal IDE后(需按TerminalIDE的Shutdown按钮)，便可以使用gcc和g++进行c++/c的编译，如下：
+
+vim a.cpp   //写入代吗
+g++ a.cpp   //编译
+./a.out     //运行
+
+
+
+此时，再用otg接个键盘或者用蓝牙键盘的话，那么整个apad就相当于你的电脑，得心应手。
+
+如果你熟悉Linux和vim，以上方法是不错的选择，如果不熟悉的话，可以用C4droid。这里在贴出几个工具：（下载地址可以自己搜，我只贴出GooglePlay上的地址。）
+
+　　AIDE：可以在android平板/手机上编写android应用，编译后可直接安装。
+
+　　C4droid：可以在android平板/手机上编写并编译c/c++，不过不够强大。但比较容易安装。
+
+　　ADDI：可以在android平板/手机上执行少量的matlab指令。
+
+以上适合apad+键盘，如果没有键盘的话，我觉得还是别折腾了，没有这个必要吧。写一写小程序还是可以的，大的项目就不行了，编译会很慢的。
+</content>
+      <categories>
+        
+          <category> Android </category>
+        
+      </categories>
+      <tags>
+        
+          <tag> android </tag>
+        
+          <tag> cpp </tag>
+        
+          <tag> c </tag>
+        
+      </tags>
+      <tags></tags>
+    </entry>
+  
+</search>
